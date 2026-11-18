@@ -1,0 +1,35 @@
+# Demo: the mirror dry-runs the local archive server over the compose network.
+#   docker compose -f deploy/docker-compose.yml up --build --abort-on-container-exit
+services:
+  archive:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: bench
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/robots.txt')"]
+      interval: 2s
+      retries: 15
+
+  mirror:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: runtime
+    depends_on:
+      archive:
+        condition: service_healthy
+    command: ["mirror", "http://archive:8080/", "--dry-run"]
+    environment:
+      ARCHIVE_MIRROR_LISTING_WORKERS: "8"
+      ARCHIVE_MIRROR_MAX_IN_FLIGHT: "8"
+      ARCHIVE_MIRROR_PER_HOST_RATE: "100"
+      ARCHIVE_MIRROR_PER_HOST_BURST: "8"
+      ARCHIVE_MIRROR_METRICS_PORT: "9100"
+    ports:
+      - "9100:9100"
+    volumes:
+      - mirror-state:/data
+
+volumes:
+  mirror-state:

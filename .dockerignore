@@ -1,0 +1,15 @@
+.git
+.venv
+.github
+data
+docs
+tests
+_original
+CLAUDE.md
+HANDOFF.md
+.env
+**/__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.hypothesis

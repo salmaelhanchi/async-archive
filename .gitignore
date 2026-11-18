@@ -1,0 +1,30 @@
+# private handoff files: never commit
+CLAUDE.md
+HANDOFF.md
+_original/
+
+# environments and secrets
+.env
+.venv/
+
+# python caches and builds
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+dist/
+build/
+*.egg-info/
+
+# front end
+node_modules/
+web/dist/
+
+# local data
+data/
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.db
