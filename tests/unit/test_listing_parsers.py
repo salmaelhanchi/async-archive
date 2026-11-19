@@ -4,7 +4,8 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from bench.archive_server import RENDERERS, Node
+from bench.archive_server import RENDERERS
+from bench.tree import Node
 from hypothesis import given
 from hypothesis import strategies as st
 

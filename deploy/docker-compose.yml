@@ -1,4 +1,6 @@
-# Demo: the mirror dry-runs the local archive server over the compose network.
+# Demo: the mirror downloads the local archive server's tree over the compose network,
+# verifies every file against its published .sha256, and keeps state and files in a volume.
+# Run it twice: the second run lists again and downloads nothing.
 #   docker compose -f deploy/docker-compose.yml up --build --abort-on-container-exit
 services:
   archive:
@@ -6,6 +8,16 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       target: bench
+    command:
+      - /app/.venv/bin/python
+      - -m
+      - bench.archive_server
+      - --host=0.0.0.0
+      - --port=8080
+      - --depth=2
+      - --files=10
+      - --max-size=2000000
+      - --checksums
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/robots.txt')"]
       interval: 2s
@@ -19,8 +31,10 @@ services:
     depends_on:
       archive:
         condition: service_healthy
-    command: ["mirror", "http://archive:8080/", "--dry-run"]
+    command: ["mirror", "http://archive:8080/"]
     environment:
+      ARCHIVE_MIRROR_MIRROR_ROOT: /data/mirror
+      ARCHIVE_MIRROR_DOWNLOAD_WORKERS: "8"
       ARCHIVE_MIRROR_LISTING_WORKERS: "8"
       ARCHIVE_MIRROR_MAX_IN_FLIGHT: "8"
       ARCHIVE_MIRROR_PER_HOST_RATE: "100"

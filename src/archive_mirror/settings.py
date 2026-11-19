@@ -13,7 +13,10 @@ PRODUCT_NAME = "async-archive-mirror"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="ARCHIVE_MIRROR_", env_file=".env", extra="ignore")
+    # env_ignore_empty: a variable left blank (as in .env.example) means "use the default"
+    model_config = SettingsConfigDict(
+        env_prefix="ARCHIVE_MIRROR_", env_file=".env", extra="ignore", env_ignore_empty=True
+    )
 
     # where state lives
     state_db: Path = Path("data/state.sqlite")
@@ -28,6 +31,15 @@ class Settings(BaseSettings):
     per_host_burst: int = Field(default=2, ge=1)
     respect_robots: bool = True
     http2: bool = True
+
+    # downloads
+    mirror_root: Path = Path("data/mirror")
+    download_workers: int = Field(default=4, ge=1, le=256)
+    download_queue_size: int = Field(default=64, ge=1)
+    max_download_bytes: int | None = Field(
+        default=None, ge=0, description="byte budget per run, counted by listed size"
+    )
+    min_free_bytes: int = Field(default=1024**3, ge=0, description="free disk to keep")
 
     # retries
     request_timeout_s: float = Field(default=30.0, gt=0)

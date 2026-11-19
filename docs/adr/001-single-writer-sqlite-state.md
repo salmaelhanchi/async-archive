@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. Amended by [ADR 004](004-resumable-downloads.md): download workers also write,
+so transactions now take turns behind an `asyncio.Lock` in the store.
 
 ## Context
 

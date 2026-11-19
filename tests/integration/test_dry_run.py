@@ -1,60 +1,21 @@
 """End to end: the real HTTP stack and SQLite against the local archive server."""
 
 import time
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
-from pathlib import Path
 
 import aiosqlite
 import pytest
-from aiohttp.test_utils import TestServer
-from bench.archive_server import (
-    HITS,
-    STYLES,
-    ServerConfig,
-    TreeSpec,
-    build_tree,
-    expected_files,
-    make_app,
-)
+from bench.archive_server import HITS, STYLES, ServerConfig
+from bench.tree import TreeSpec, build_tree, expected_files
 
 from archive_mirror.composition import run_dry_run
 from archive_mirror.domain.status import ListingStatus
-from archive_mirror.settings import Settings
+from tests.integration.serving import SettingsFactory, archive
 
 pytestmark = pytest.mark.integration
 
 SPEC = TreeSpec(depth=2, dirs_per_dir=3, files_per_dir=4)  # 13 directories, 52 files
 TREE = build_tree(SPEC)
 FILES = expected_files(TREE)
-
-
-@asynccontextmanager
-async def archive(config: ServerConfig) -> AsyncIterator[TestServer]:
-    server = TestServer(make_app(config))
-    await server.start_server()
-    try:
-        yield server
-    finally:
-        await server.close()
-
-
-SettingsFactory = Callable[..., Settings]
-
-
-@pytest.fixture
-def settings(tmp_path: Path) -> SettingsFactory:
-    def make(**overrides: object) -> Settings:
-        values: dict[str, object] = {
-            "state_db": tmp_path / "state.sqlite",
-            "per_host_rate": 500.0,
-            "per_host_burst": 50,
-            "backoff_base_s": 0.01,
-            "http2": False,
-        }
-        return Settings(_env_file=None, **(values | overrides))  # type: ignore[arg-type]
-
-    return make
 
 
 @pytest.mark.parametrize("style", STYLES)

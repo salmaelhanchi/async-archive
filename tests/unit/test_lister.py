@@ -1,15 +1,17 @@
 """Lister service with fake fetcher, policy and writer."""
 
 import asyncio
+from collections.abc import Sequence
 
 import pytest
-from bench.archive_server import TreeSpec, build_tree, expected_files, render_nginx
+from bench.archive_server import render_nginx
+from bench.tree import TreeSpec, build_tree, expected_files
 
 from archive_mirror.adapters.listing import parse_listing
 from archive_mirror.domain.errors import FetchFailed
-from archive_mirror.domain.models import FetchedPage
+from archive_mirror.domain.models import FetchedPage, PendingFile
 from archive_mirror.domain.status import ListingStatus
-from archive_mirror.services.lister import CrawlLimits, Lister
+from archive_mirror.services.lister import CrawlLimits, Lister, OnRecorded
 from tests.fakes import AllowPolicy, FakeFetcher, MemoryWriter, html_page
 
 ROOT = "https://archive.example/"
@@ -33,6 +35,7 @@ def make_lister(
     max_depth: int = 10,
     max_pages: int = 1000,
     queue: int = 8,
+    on_recorded: OnRecorded | None = None,
 ) -> Lister:
     return Lister(
         fetcher=fetcher,
@@ -45,6 +48,7 @@ def make_lister(
             max_listing_pages=max_pages,
             write_queue_size=queue,
         ),
+        on_recorded=on_recorded,
     )
 
 
@@ -74,6 +78,25 @@ async def test_files_carry_provenance() -> None:
     assert nested.relative_path.startswith("archive.example/dir-1/dir-0/")
     depths = {o.url: (o.depth, o.parent_url) for o in writer.outcomes}
     assert depths[ROOT + "dir-1/dir-0/"] == (2, ROOT + "dir-1/")
+
+
+async def test_committed_files_go_to_the_download_queue_with_their_checksum_files() -> None:
+    tree = build_tree(TreeSpec(depth=1, dirs_per_dir=1, files_per_dir=3, checksums=True))
+    writer = MemoryWriter()
+    handed_on: list[PendingFile] = []
+
+    async def on_recorded(pending: Sequence[PendingFile]) -> None:
+        assert all(p.file in writer.files for p in pending)  # durable before handed on
+        handed_on.extend(pending)
+
+    await make_lister(FakeFetcher(site(tree)), writer, on_recorded=on_recorded).crawl([ROOT])
+
+    assert len(handed_on) == len(writer.files) == 12
+    data = next(p.file for p in handed_on if p.file.name == "data-0.tar.gz")
+    sidecar = next(p.file for p in handed_on if p.file.name == "data-0.tar.gz.sha256")
+    assert data.checksum is not None
+    assert (data.checksum.url, data.checksum.algorithm) == (sidecar.url, "sha256")
+    assert sidecar.checksum is None
 
 
 async def test_directories_below_max_depth_are_recorded_as_skipped() -> None:

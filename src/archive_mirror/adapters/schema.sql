@@ -1,4 +1,5 @@
--- State database, schema version 1. Statuses mirror archive_mirror.domain.status.
+-- State database, schema version 2 (the latest; older files are migrated in state_store.py).
+-- Statuses mirror archive_mirror.domain.status.
 
 CREATE TABLE IF NOT EXISTS runs (
     run_id        TEXT PRIMARY KEY,
@@ -42,9 +43,24 @@ CREATE TABLE IF NOT EXISTS files (
     listing_format  TEXT NOT NULL CHECK (listing_format IN ('apache', 'nginx', 'iis')),
     first_seen_run  TEXT NOT NULL REFERENCES runs (run_id),
     last_seen_run   TEXT NOT NULL REFERENCES runs (run_id),
-    updated_at      TEXT NOT NULL
+    updated_at      TEXT NOT NULL,
+    -- version 2: downloads
+    checksum_url        TEXT,
+    checksum_algorithm  TEXT CHECK (checksum_algorithm IN ('sha256', 'sha512', 'md5')),
+    -- a done file always has a digest and a size: "done" is never claimed without proof.
+    -- COALESCE because a CHECK that evaluates to NULL passes.
+    sha256              TEXT CHECK (
+                            (sha256 IS NULL AND status != 'done')
+                            OR COALESCE(length(sha256), 0) = 64),
+    bytes_on_disk       INTEGER CHECK (
+                            (bytes_on_disk IS NULL AND status != 'done')
+                            OR COALESCE(bytes_on_disk, -1) >= 0),
+    verified_by         TEXT CHECK (verified_by IN ('checksum', 'size', 'none')),
+    etag                TEXT,
+    done_run            TEXT REFERENCES runs (run_id)
 );
 
 CREATE INDEX IF NOT EXISTS files_by_status ON files (status);
 CREATE INDEX IF NOT EXISTS files_by_last_seen_run ON files (last_seen_run);
 CREATE INDEX IF NOT EXISTS listings_by_last_run ON listings (last_run);
+CREATE INDEX IF NOT EXISTS files_by_listing ON files (listing_url);

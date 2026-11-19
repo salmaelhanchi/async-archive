@@ -4,8 +4,17 @@ import asyncio
 from collections import Counter
 from collections.abc import Sequence
 
-from archive_mirror.domain.errors import FetchFailed
-from archive_mirror.domain.models import FetchedPage, ListingOutcome, RemoteFile
+from archive_mirror.domain.errors import FetchFailed, InvalidTransition
+from archive_mirror.domain.models import (
+    ChecksumRef,
+    DownloadedFile,
+    FetchedPage,
+    ListingOutcome,
+    PendingFile,
+    RemoteFile,
+    TransferResult,
+)
+from archive_mirror.domain.status import FileStatus, check_transition
 
 
 class FakeClock:
@@ -63,13 +72,103 @@ class MemoryWriter:
         self.outcomes: list[ListingOutcome] = []
         self.files: list[RemoteFile] = []
 
-    async def record_listing(self, outcome: ListingOutcome, files: Sequence[RemoteFile]) -> None:
+    async def record_listing(
+        self, outcome: ListingOutcome, files: Sequence[RemoteFile]
+    ) -> list[PendingFile]:
         if self.delay:
             await asyncio.sleep(self.delay)
         if outcome.url == self.fail_on:
             raise RuntimeError("disk full")
         self.outcomes.append(outcome)
         self.files.extend(files)
+        return [PendingFile(f, FileStatus.LISTED) for f in files]
 
     def by_url(self) -> dict[str, ListingOutcome]:
         return {o.url: o for o in self.outcomes}
+
+
+# --- downloads --------------------------------------------------------------------------
+
+
+class FakeTransfer:
+    """Returns scripted results per URL (the last one repeats); can raise or be slow."""
+
+    def __init__(self, results: dict[str, list[TransferResult | Exception]], delay: float = 0.0):
+        self.results = results
+        self.delay = delay
+        self.calls: Counter[str] = Counter()
+        self.active = 0
+        self.peak_active = 0
+
+    async def download(self, url: str, relative_path: str) -> TransferResult:
+        self.calls[url] += 1
+        self.active += 1
+        self.peak_active = max(self.peak_active, self.active)
+        try:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            script = self.results[url]
+            outcome = script[min(self.calls[url], len(script)) - 1]
+        finally:
+            self.active -= 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class FakeStorage:
+    """Digests are scripted per relative path (the last one repeats)."""
+
+    def __init__(self, digests: dict[str, list[str]] | None = None, free: int = 10**12) -> None:
+        self.digests = digests or {}
+        self.free = free
+        self.finalized: list[str] = []
+        self.discarded: list[str] = []
+        self._reads: Counter[str] = Counter()
+
+    async def digest_part(self, relative_path: str, algorithms: frozenset[str]) -> dict[str, str]:
+        self._reads[relative_path] += 1
+        script = self.digests.get(relative_path, ["0" * 64])
+        digest = script[min(self._reads[relative_path], len(script)) - 1]
+        return dict.fromkeys(algorithms, digest)
+
+    async def finalize(self, relative_path: str) -> None:
+        self.finalized.append(relative_path)
+
+    def discard_part(self, relative_path: str) -> None:
+        self.discarded.append(relative_path)
+
+    def free_bytes(self) -> int:
+        return self.free
+
+
+class FakeChecksums:
+    def __init__(self, digests: dict[str, str] | None = None) -> None:
+        self.digests = digests or {}
+
+    async def expected(self, ref: ChecksumRef, file_name: str) -> str | None:
+        return self.digests.get(file_name)
+
+
+class MemoryDownloadState:
+    """Applies the real state machine to an in-memory status table."""
+
+    def __init__(self, statuses: dict[str, FileStatus] | None = None) -> None:
+        self.statuses = statuses or {}
+        self.done: dict[str, DownloadedFile] = {}
+        self.errors: dict[str, str | None] = {}
+
+    async def transition(
+        self, file_id: str, current: FileStatus, target: FileStatus, *, error: str | None = None
+    ) -> None:
+        check_transition(current, target)
+        if self.statuses.get(file_id, FileStatus.LISTED) is not current:
+            raise InvalidTransition(f"{file_id} is not in status {current}")
+        self.statuses[file_id] = target
+        self.errors[file_id] = error
+
+    async def mark_done(self, file_id: str, proof: DownloadedFile) -> None:
+        if self.statuses.get(file_id) is not FileStatus.DOWNLOADING:
+            raise InvalidTransition(f"{file_id} is not in status downloading")
+        self.statuses[file_id] = FileStatus.DONE
+        self.done[file_id] = proof

@@ -17,3 +17,11 @@ class UnrecognizedListing(Exception):
 
 class InvalidTransition(ValueError):
     """A status change that the state machine does not allow."""
+
+
+class VerificationFailed(Exception):
+    """A downloaded file does not match its listed size or its published checksum."""
+
+
+class StateLocked(Exception):
+    """Another process is already using this state database."""

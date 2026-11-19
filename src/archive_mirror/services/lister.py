@@ -11,17 +11,20 @@ Shape of the pipeline::
 * The write queue is bounded, so listers pause when the database falls behind (backpressure).
 * There is a single writer, so SQLite never sees two transactions racing on one connection.
 * Counters move only after the writer's commit returns: what is reported is on disk.
+* In a mirror run, the writer hands the committed files that still need downloading to
+  ``on_recorded`` (the download queue). It is bounded too, so slow downloads slow the crawl.
 """
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 
 import structlog
 
 from archive_mirror import metrics
+from archive_mirror.domain.checksums import checksum_refs
 from archive_mirror.domain.errors import FetchFailed, UnrecognizedListing
-from archive_mirror.domain.models import ListingFormat, ListingOutcome, RemoteFile
+from archive_mirror.domain.models import ListingFormat, ListingOutcome, PendingFile, RemoteFile
 from archive_mirror.domain.status import ListingStatus
 from archive_mirror.domain.urls import as_directory_url, is_within
 from archive_mirror.services.ports import (
@@ -30,6 +33,8 @@ from archive_mirror.services.ports import (
     ListingParserFn,
     PageFetcher,
 )
+
+OnRecorded = Callable[[Sequence[PendingFile]], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,12 +78,14 @@ class Lister:
         policy: FetchPolicy,
         writer: CrawlStateWriter,
         limits: CrawlLimits,
+        on_recorded: OnRecorded | None = None,
     ) -> None:
         self._fetcher = fetcher
         self._parse = parse
         self._policy = policy
         self._writer = writer
         self._limits = limits
+        self._on_recorded = on_recorded
         self._directories: asyncio.Queue[_Directory | None] = asyncio.Queue()
         self._writes: asyncio.Queue[_Visit | None] = asyncio.Queue(limits.write_queue_size)
         self._seen: set[str] = set()
@@ -125,7 +132,7 @@ class Lister:
             visit = await self._writes.get()
             if visit is None:
                 return
-            await self._writer.record_listing(visit.outcome, visit.files)
+            pending = await self._writer.record_listing(visit.outcome, visit.files)
             outcome = visit.outcome
             self.stats.listings[outcome.status] += 1
             self.stats.files += len(visit.files)
@@ -142,6 +149,8 @@ class Lister:
                 files=len(visit.files),
                 detail=outcome.detail,
             )
+            if self._on_recorded is not None and pending:
+                await self._on_recorded(pending)  # blocks while the download queue is full
 
     async def _visit(self, directory: _Directory) -> _Visit:
         def done(
@@ -199,9 +208,10 @@ class Lister:
                 self._enqueue(
                     _Directory(entry.url, directory.root, directory.depth + 1, directory.url)
                 )
+        checksums = checksum_refs(listing.files)
         files = tuple(
             [
-                RemoteFile.from_entry(entry, listing)
+                RemoteFile.from_entry(entry, listing, checksums.get(entry.url))
                 for entry in listing.files
                 if is_within(entry.url, directory.root) and await self._policy.allowed(entry.url)
             ]

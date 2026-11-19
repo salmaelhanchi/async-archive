@@ -19,6 +19,18 @@ LISTINGS = Counter(
 FILES_RECORDED = Counter("archive_mirror_files_recorded_total", "Files written to the state DB.")
 QUEUE_DEPTH = Gauge("archive_mirror_queue_depth", "Items waiting in a queue.", ["queue"])
 
+BYTES_RECEIVED = Counter(
+    "archive_mirror_download_bytes_total", "File bytes received, by host.", ["host"]
+)
+RESUMES = Counter(
+    "archive_mirror_range_resumes_total", "Responses that continued a .part file (206).", ["host"]
+)
+FILES_FINISHED = Counter(
+    "archive_mirror_files_finished_total",
+    "Files leaving the download queue, by outcome (done, failed, skipped).",
+    ["outcome"],
+)
+
 
 def serve(port: int) -> None:
     """Expose ``/metrics`` on a background thread."""

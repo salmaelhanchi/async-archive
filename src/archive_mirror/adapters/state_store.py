@@ -1,11 +1,15 @@
 """SQLite state (via aiosqlite): runs, listings and files, with status ``CHECK``s.
 
-One connection, one writer. Every write method commits before returning, so anything a
-caller reports has already reached disk ("durable before visible").
+One connection per run. Every write runs inside ``_transaction``: an ``asyncio.Lock`` makes
+transactions take turns, so a download worker's commit can never commit half of the
+listing writer's batch (see ADR 004). Every write method commits before returning, so
+anything a caller reports has already reached disk ("durable before visible").
 """
 
+import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from importlib.resources import files as package_files
 from pathlib import Path
@@ -13,56 +17,20 @@ from typing import Any, Self
 
 import aiosqlite
 
+from archive_mirror.adapters import state_sql as sql
+from archive_mirror.domain.checksums import make_ref
 from archive_mirror.domain.errors import InvalidTransition
-from archive_mirror.domain.models import ListingOutcome, RemoteFile, RunSummary
-from archive_mirror.domain.status import (
-    FileStatus,
-    ListingStatus,
-    RunOutcome,
-    check_transition,
+from archive_mirror.domain.models import (
+    DownloadedFile,
+    ListingFormat,
+    ListingOutcome,
+    PendingFile,
+    RemoteFile,
+    RunSummary,
 )
+from archive_mirror.domain.status import FileStatus, ListingStatus, RunOutcome, check_transition
 
-SCHEMA_VERSION = 1
-
-_UPSERT_FILE = """
-INSERT INTO files (
-    file_id, url, relative_path, name, size_bytes, size_exact, modified, is_archive, status,
-    listing_url, listing_format, first_seen_run, last_seen_run, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'listed', ?, ?, ?, ?, ?)
-ON CONFLICT (file_id) DO UPDATE SET
-    status = CASE
-        WHEN files.status = 'done'
-             AND (files.size_bytes IS NOT excluded.size_bytes
-                  OR files.modified IS NOT excluded.modified)
-        THEN 'listed' ELSE files.status END,
-    relative_path = excluded.relative_path,
-    name = excluded.name,
-    size_bytes = excluded.size_bytes,
-    size_exact = excluded.size_exact,
-    modified = excluded.modified,
-    is_archive = excluded.is_archive,
-    listing_url = excluded.listing_url,
-    listing_format = excluded.listing_format,
-    last_seen_run = excluded.last_seen_run,
-    updated_at = excluded.updated_at
-"""
-
-_UPSERT_LISTING = """
-INSERT INTO listings (
-    url, status, format, depth, parent_url, entries, attempts, detail,
-    first_seen_run, last_run, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT (url) DO UPDATE SET
-    status = excluded.status,
-    format = excluded.format,
-    depth = excluded.depth,
-    parent_url = excluded.parent_url,
-    entries = excluded.entries,
-    attempts = excluded.attempts,
-    detail = excluded.detail,
-    last_run = excluded.last_run,
-    updated_at = excluded.updated_at
-"""
+SCHEMA_VERSION = 2
 
 
 def _now() -> str:
@@ -72,6 +40,7 @@ def _now() -> str:
 class SqliteStateStore:
     def __init__(self, db: aiosqlite.Connection, run_id: str) -> None:
         self._db = db
+        self._lock = asyncio.Lock()
         self.run_id = run_id
 
     @classmethod
@@ -95,45 +64,88 @@ class SqliteStateStore:
         version = int(row[0]) if row else 0
         if version > SCHEMA_VERSION:
             raise RuntimeError(f"state DB schema {version} is newer than {SCHEMA_VERSION}")
-        if version < SCHEMA_VERSION:
+        if version == SCHEMA_VERSION:
+            return
+        if version == 0:  # new file: create the latest schema directly
             schema = package_files("archive_mirror.adapters").joinpath("schema.sql").read_text()
             await db.executescript(schema)
-            await db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            await db.commit()
+        else:
+            for target in range(version + 1, SCHEMA_VERSION + 1):
+                for statement in sql.MIGRATIONS[target]:
+                    await db.execute(statement)
+        await db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        await db.commit()
 
     async def close(self) -> None:
         await self._db.close()
 
+    @asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        async with self._lock:
+            try:
+                yield self._db
+                await self._db.commit()
+            except BaseException:
+                await self._db.rollback()
+                raise
+
+    # runs -------------------------------------------------------------------------------
+
     async def start_run(
         self, *, mode: str, start_urls: Sequence[str], config: dict[str, Any], tool_version: str
     ) -> None:
-        await self._db.execute(
-            "INSERT INTO runs (run_id, mode, outcome, started_at, start_urls, config, tool_version)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                self.run_id,
-                mode,
-                RunOutcome.RUNNING.value,
-                _now(),
-                json.dumps(list(start_urls)),
-                json.dumps(config, default=str, sort_keys=True),
-                tool_version,
-            ),
-        )
-        await self._db.commit()
+        async with self._transaction() as db:
+            await db.execute(
+                sql.INSERT_RUN,
+                (
+                    self.run_id,
+                    mode,
+                    RunOutcome.RUNNING.value,
+                    _now(),
+                    json.dumps(list(start_urls)),
+                    json.dumps(config, default=str, sort_keys=True),
+                    tool_version,
+                ),
+            )
+
+    async def recover_interrupted(self) -> tuple[int, int]:
+        """Clean up after a process that was killed. Call only while holding the state lock.
+
+        Earlier runs still marked ``running`` become ``interrupted``, and files left in
+        ``downloading`` go back to ``listed``; their ``.part`` files are resumed later.
+        Returns ``(runs, files)`` recovered.
+        """
+        async with self._transaction() as db:
+            runs = await db.execute(
+                "UPDATE runs SET outcome = 'interrupted', finished_at = ?"
+                " WHERE outcome = 'running' AND run_id != ?",
+                (_now(), self.run_id),
+            )
+            check_transition(FileStatus.DOWNLOADING, FileStatus.LISTED)
+            files = await db.execute(
+                "UPDATE files SET status = 'listed', updated_at = ?,"
+                " last_error = 'interrupted, will resume' WHERE status = 'downloading'",
+                (_now(),),
+            )
+        return runs.rowcount, files.rowcount
 
     async def finish_run(self, outcome: RunOutcome) -> None:
-        await self._db.execute(
-            "UPDATE runs SET outcome = ?, finished_at = ? WHERE run_id = ?",
-            (outcome.value, _now(), self.run_id),
-        )
-        await self._db.commit()
+        async with self._transaction() as db:
+            await db.execute(
+                "UPDATE runs SET outcome = ?, finished_at = ? WHERE run_id = ?",
+                (outcome.value, _now(), self.run_id),
+            )
 
-    async def record_listing(self, outcome: ListingOutcome, files: Sequence[RemoteFile]) -> None:
+    # listings ---------------------------------------------------------------------------
+
+    async def record_listing(
+        self, outcome: ListingOutcome, files: Sequence[RemoteFile]
+    ) -> list[PendingFile]:
+        """Store a listing and its files in one transaction. Returns the files not yet done."""
         now = _now()
-        try:
-            await self._db.execute(
-                _UPSERT_LISTING,
+        async with self._transaction() as db:
+            await db.execute(
+                sql.UPSERT_LISTING,
                 (
                     outcome.url,
                     outcome.status.value,
@@ -148,11 +160,16 @@ class SqliteStateStore:
                     now,
                 ),
             )
-            await self._db.executemany(_UPSERT_FILE, [self._file_row(f, now) for f in files])
-            await self._db.commit()
-        except BaseException:
-            await self._db.rollback()
-            raise
+            if not files:
+                return []
+            await db.executemany(sql.UPSERT_FILE, [self._file_row(f, now) for f in files])
+            async with db.execute(
+                "SELECT file_id, status FROM files"
+                " WHERE listing_url = ? AND last_seen_run = ? AND status != 'done'",
+                (files[0].listing_url, self.run_id),
+            ) as cursor:
+                statuses = {row[0]: FileStatus(row[1]) async for row in cursor}
+        return [PendingFile(f, statuses[f.file_id]) for f in files if f.file_id in statuses]
 
     def _file_row(self, f: RemoteFile, now: str) -> tuple[object, ...]:
         return (
@@ -169,7 +186,11 @@ class SqliteStateStore:
             self.run_id,
             self.run_id,
             now,
+            f.checksum.url if f.checksum else None,
+            f.checksum.algorithm if f.checksum else None,
         )
+
+    # files ------------------------------------------------------------------------------
 
     async def file_status(self, file_id: str) -> FileStatus | None:
         async with self._db.execute("SELECT status FROM files WHERE file_id = ?", (file_id,)) as c:
@@ -179,35 +200,75 @@ class SqliteStateStore:
     async def transition(
         self, file_id: str, current: FileStatus, target: FileStatus, *, error: str | None = None
     ) -> None:
-        """Move one file between statuses. The ``WHERE status = ?`` makes it a compare-and-set."""
+        """Move one file between statuses. The ``WHERE status = ?`` makes it a compare-and-set.
+
+        Moving to ``done`` goes through ``mark_done``, which records the proof.
+        """
+        if target is FileStatus.DONE:
+            raise InvalidTransition("use mark_done to finish a file")
         check_transition(current, target)
-        cursor = await self._db.execute(
-            "UPDATE files SET status = ?, last_error = ?, updated_at = ?,"
-            " attempts = attempts + (? = 'downloading')"
-            " WHERE file_id = ? AND status = ?",
-            (target.value, error, _now(), target.value, file_id, current.value),
-        )
-        await self._db.commit()
-        if cursor.rowcount != 1:
-            raise InvalidTransition(f"{file_id} is not in status {current}")
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                "UPDATE files SET status = ?, last_error = ?, updated_at = ?,"
+                " attempts = attempts + (? = 'downloading')"
+                " WHERE file_id = ? AND status = ?",
+                (target.value, error, _now(), target.value, file_id, current.value),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidTransition(f"{file_id} is not in status {current}")
+
+    async def mark_done(self, file_id: str, proof: DownloadedFile) -> None:
+        """``downloading -> done``, with the digest and size that justify it."""
+        check_transition(FileStatus.DOWNLOADING, FileStatus.DONE)
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                "UPDATE files SET status = 'done', sha256 = ?, bytes_on_disk = ?,"
+                " verified_by = ?, etag = ?, done_run = ?, last_error = NULL, updated_at = ?"
+                " WHERE file_id = ? AND status = 'downloading'",
+                (
+                    proof.sha256,
+                    proof.size,
+                    proof.verified_by,
+                    proof.etag,
+                    self.run_id,
+                    _now(),
+                    file_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidTransition(f"{file_id} is not in status downloading")
+
+    async def pending_files(self, batch_size: int = 500) -> AsyncIterator[PendingFile]:
+        """Every file not yet done, in ``file_id`` order, read in batches (keyset paging)."""
+        after = ""
+        while True:
+            async with self._db.execute(sql.SELECT_PENDING, (after, batch_size)) as cursor:
+                rows = list(await cursor.fetchall())
+            for row in rows:
+                yield _pending_from_row(row)
+            if len(rows) < batch_size:
+                return
+            after = rows[-1][0]
+
+    async def file_totals(self) -> tuple[dict[FileStatus, int], int]:
+        """Files by status across the whole state database, and bytes of done files."""
+        totals = dict.fromkeys(FileStatus, 0)
+        done_bytes = 0
+        async with self._db.execute(
+            "SELECT status, COUNT(*), COALESCE(SUM(bytes_on_disk), 0) FROM files GROUP BY status"
+        ) as cursor:
+            async for status, count, size in cursor:
+                totals[FileStatus(status)] = count
+                if status == FileStatus.DONE.value:
+                    done_bytes = size
+        return totals, done_bytes
 
     async def run_summary(self) -> RunSummary:
-        async with self._db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes IS NULL), 0),"
-            " COALESCE(SUM(size_bytes IS NOT NULL AND size_exact = 0), 0),"
-            " COALESCE(SUM(size_bytes), 0), COALESCE(SUM(is_archive), 0),"
-            " COALESCE(SUM(status = 'done'), 0)"
-            " FROM files WHERE last_seen_run = ?",
-            (self.run_id,),
-        ) as cursor:
+        async with self._db.execute(sql.SUMMARY_FILES, (self.run_id,)) as cursor:
             row = await cursor.fetchone()
         if row is None:  # an aggregate query always returns one row
             raise RuntimeError("summary query returned no row")
-        async with self._db.execute(
-            "SELECT status, format, COUNT(*) FROM listings WHERE last_run = ?"
-            " GROUP BY status, format",
-            (self.run_id,),
-        ) as cursor:
+        async with self._db.execute(sql.SUMMARY_LISTINGS, (self.run_id,)) as cursor:
             groups = await cursor.fetchall()
         by_status: dict[ListingStatus, int] = dict.fromkeys(ListingStatus, 0)
         by_format: dict[str, int] = {}
@@ -226,3 +287,23 @@ class SqliteStateStore:
             listings=by_status,
             listings_by_format=by_format,
         )
+
+
+def _pending_from_row(row: Sequence[Any]) -> PendingFile:
+    (fid, url, rel, name, size, exact, modified, archive, listing_url, fmt, c_url, c_algo) = row[
+        :12
+    ]
+    remote = RemoteFile(
+        file_id=fid,
+        url=url,
+        relative_path=rel,
+        name=name,
+        size_bytes=size,
+        size_exact=bool(exact),
+        modified=datetime.fromisoformat(modified) if modified else None,
+        is_archive=bool(archive),
+        listing_url=listing_url,
+        listing_format=ListingFormat(fmt),
+        checksum=make_ref(c_url, c_algo) if c_url and c_algo else None,
+    )
+    return PendingFile(remote, FileStatus(row[12]))

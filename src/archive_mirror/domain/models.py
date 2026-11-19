@@ -4,7 +4,7 @@ import enum
 from dataclasses import dataclass
 from datetime import datetime
 
-from archive_mirror.domain.status import ListingStatus
+from archive_mirror.domain.status import FileStatus, ListingStatus
 from archive_mirror.domain.urls import file_id, local_relative_path
 
 ARCHIVE_SUFFIXES = (
@@ -80,6 +80,15 @@ def is_archive(name: str) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class ChecksumRef:
+    """Where the expected digest of one file is published."""
+
+    url: str
+    algorithm: str
+    shared: bool  # a SHA256SUMS-style file that covers many files
+
+
+@dataclass(frozen=True, slots=True)
 class RemoteFile:
     """A file found in a listing, with where it came from and where it will be stored."""
 
@@ -93,9 +102,12 @@ class RemoteFile:
     is_archive: bool
     listing_url: str
     listing_format: ListingFormat
+    checksum: ChecksumRef | None = None
 
     @classmethod
-    def from_entry(cls, entry: ListingEntry, listing: Listing) -> "RemoteFile":
+    def from_entry(
+        cls, entry: ListingEntry, listing: Listing, checksum: ChecksumRef | None = None
+    ) -> "RemoteFile":
         return cls(
             file_id=file_id(entry.url),
             url=entry.url,
@@ -107,7 +119,19 @@ class RemoteFile:
             is_archive=is_archive(entry.name),
             listing_url=listing.url,
             listing_format=listing.format,
+            checksum=checksum,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PendingFile:
+    """A file that still needs downloading, with the status it was read in.
+
+    The status is what the download worker's compare-and-set expects to find.
+    """
+
+    file: RemoteFile
+    status: FileStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,3 +161,47 @@ class RunSummary:
     files_already_done: int
     listings: dict[ListingStatus, int]
     listings_by_format: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class TransferResult:
+    """What one download call left in the part file."""
+
+    size: int  # bytes in the part file now
+    total: int | None  # full length the server announced, when it did
+    resumed_from: int  # offset of the response that completed the file; 0 = whole body
+    received: int  # bytes received over the wire by this call, across retries
+    etag: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadedFile:
+    """Proof that a file is complete: what is recorded when it moves to ``done``."""
+
+    sha256: str
+    size: int
+    verified_by: str  # 'checksum', 'size' or 'none'
+    etag: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadReport:
+    """What the download workers did in one run. Counted after each commit."""
+
+    files_done: int
+    files_failed: int
+    files_skipped: int
+    files_resumed: int
+    files_verified_by_checksum: int
+    bytes_received: int
+
+
+@dataclass(frozen=True, slots=True)
+class MirrorSummary:
+    """A mirror run: the crawl (absent for ``resume``), the downloads, and the state after."""
+
+    run_id: str
+    crawl: RunSummary | None
+    downloads: DownloadReport
+    files_by_status: dict[FileStatus, int]
+    bytes_done: int

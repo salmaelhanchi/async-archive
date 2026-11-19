@@ -12,6 +12,7 @@ import pytest
 from archive_mirror.adapters.state_store import SCHEMA_VERSION, SqliteStateStore
 from archive_mirror.domain.errors import InvalidTransition
 from archive_mirror.domain.models import (
+    DownloadedFile,
     EntryKind,
     Listing,
     ListingEntry,
@@ -22,6 +23,8 @@ from archive_mirror.domain.models import (
 from archive_mirror.domain.status import FileStatus, ListingStatus, RunOutcome
 
 pytestmark = pytest.mark.integration
+
+FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 DIR_URL = "https://archive.example/pub/"
 LISTING = Listing(url=DIR_URL, format=ListingFormat.NGINX, entries=())
@@ -50,6 +53,14 @@ def listed(entries: int = 2) -> ListingOutcome:
         attempts=1,
         detail=None,
     )
+
+
+PROOF = DownloadedFile(sha256="f" * 64, size=100, verified_by="size", etag='"e"')
+
+
+async def finish(store: SqliteStateStore, f: RemoteFile) -> None:
+    await store.transition(f.file_id, FileStatus.LISTED, FileStatus.DOWNLOADING)
+    await store.mark_done(f.file_id, PROOF)
 
 
 async def open_run(path: Path, run_id: str) -> SqliteStateStore:
@@ -106,8 +117,7 @@ async def test_done_file_goes_back_to_listed_when_upstream_changes(
     same, grown = remote("a.bin"), remote("b.bin")
     await store.record_listing(listed(), [same, grown])
     for f in (same, grown):
-        await store.transition(f.file_id, FileStatus.LISTED, FileStatus.DOWNLOADING)
-        await store.transition(f.file_id, FileStatus.DOWNLOADING, FileStatus.DONE)
+        await finish(store, f)
 
     await store.record_listing(listed(), [same, replace(grown, size_bytes=999)])
 
@@ -157,3 +167,96 @@ async def test_a_failed_write_rolls_back_the_whole_listing(store: SqliteStateSto
         assert await cursor.fetchone() == (0,)
     async with store._db.execute("SELECT COUNT(*) FROM listings") as cursor:
         assert await cursor.fetchone() == (0,)
+
+
+# --- version 2: downloads ---------------------------------------------------------------
+
+
+async def test_a_version_1_file_is_migrated_to_the_same_schema_as_a_new_one(
+    tmp_path: Path,
+) -> None:
+    old = tmp_path / "old.sqlite"
+    with sqlite3.connect(old) as db:
+        db.executescript((FIXTURES / "schema" / "v1.sql").read_text(encoding="utf-8"))
+        db.execute("PRAGMA user_version = 1")
+    await (await SqliteStateStore.open(old, "run-a")).close()
+    await (await SqliteStateStore.open(tmp_path / "new.sqlite", "run-a")).close()
+
+    def shape(path: Path) -> tuple[object, ...]:
+        with sqlite3.connect(path) as db:
+            columns = db.execute("SELECT name, type FROM pragma_table_info('files')").fetchall()
+            indexes = db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+            ).fetchall()
+            version = db.execute("PRAGMA user_version").fetchone()
+        return sorted(columns), sorted(indexes), version
+
+    assert shape(old) == shape(tmp_path / "new.sqlite")
+
+
+async def test_record_listing_returns_only_files_not_done(store: SqliteStateStore) -> None:
+    a, b = remote("a.bin"), remote("b.bin")
+    pending = await store.record_listing(listed(), [a, b])
+    assert [(p.file.name, p.status) for p in pending] == [
+        ("a.bin", FileStatus.LISTED),
+        ("b.bin", FileStatus.LISTED),
+    ]
+
+    await finish(store, a)
+    await store.transition(b.file_id, FileStatus.LISTED, FileStatus.DOWNLOADING)
+    await store.transition(b.file_id, FileStatus.DOWNLOADING, FileStatus.FAILED, error="HTTP 500")
+    pending = await store.record_listing(listed(), [a, b])
+
+    assert [(p.file.name, p.status) for p in pending] == [("b.bin", FileStatus.FAILED)]
+
+
+async def test_done_needs_proof(store: SqliteStateStore) -> None:
+    f = remote("a.bin")
+    await store.record_listing(listed(), [f])
+    await store.transition(f.file_id, FileStatus.LISTED, FileStatus.DOWNLOADING)
+
+    with pytest.raises(InvalidTransition, match="mark_done"):
+        await store.transition(f.file_id, FileStatus.DOWNLOADING, FileStatus.DONE)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):  # not even by hand
+        await store._db.execute("UPDATE files SET status = 'done'")
+
+    await store.mark_done(f.file_id, PROOF)
+    async with store._db.execute(
+        "SELECT status, sha256, bytes_on_disk, verified_by, done_run FROM files"
+    ) as cursor:
+        assert await cursor.fetchone() == ("done", "f" * 64, 100, "size", "run-a")
+    with pytest.raises(InvalidTransition, match="not in status downloading"):
+        await store.mark_done(f.file_id, PROOF)
+
+
+async def test_recovery_after_a_kill_resets_downloads_and_closes_old_runs(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite"
+    killed = await open_run(path, "run-a")
+    a, b = remote("a.bin"), remote("b.bin")
+    await killed.record_listing(listed(), [a, b])
+    await killed.transition(a.file_id, FileStatus.LISTED, FileStatus.DOWNLOADING)
+    await killed.close()  # no finish_run: the process "died"
+
+    resumed = await open_run(path, "run-b")
+    recovered = await resumed.recover_interrupted()
+    async with resumed._db.execute("SELECT run_id, outcome FROM runs ORDER BY run_id") as c:
+        runs = await c.fetchall()
+    status_a = await resumed.file_status(a.file_id)
+    await resumed.close()
+
+    assert recovered == (1, 1)
+    assert runs == [("run-a", "interrupted"), ("run-b", "running")]
+    assert status_a is FileStatus.LISTED
+
+
+async def test_pending_files_pages_through_everything_not_done(store: SqliteStateStore) -> None:
+    files = [remote(f"f{i}.bin") for i in range(5)]
+    await store.record_listing(listed(5), files)
+    await finish(store, files[0])
+
+    pending = [p async for p in store.pending_files(batch_size=2)]
+
+    assert sorted(p.file.name for p in pending) == ["f1.bin", "f2.bin", "f3.bin", "f4.bin"]
+    assert pending[0].file == next(f for f in files if f.file_id == pending[0].file.file_id)
+    totals, done_bytes = await store.file_totals()
+    assert (totals[FileStatus.DONE], totals[FileStatus.LISTED], done_bytes) == (1, 4, 100)
