@@ -1,4 +1,4 @@
--- State database, schema version 2 (the latest; older files are migrated in state_store.py).
+-- State database, schema version 3 (the latest; older files are migrated in state_store.py).
 -- Statuses mirror archive_mirror.domain.status.
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -57,10 +57,25 @@ CREATE TABLE IF NOT EXISTS files (
                             OR COALESCE(bytes_on_disk, -1) >= 0),
     verified_by         TEXT CHECK (verified_by IN ('checksum', 'size', 'none')),
     etag                TEXT,
-    done_run            TEXT REFERENCES runs (run_id)
+    done_run            TEXT REFERENCES runs (run_id),
+    -- version 3: unpacking. Only an archive whose download is done has an extract status.
+    extract_status      TEXT CHECK (
+                            extract_status IS NULL
+                            OR (extract_status IN
+                                    ('pending', 'extracting', 'done', 'failed', 'unsupported')
+                                AND is_archive = 1 AND status = 'done')),
+    extract_error       TEXT,
+    -- an extracted archive always has its counts: "done" is never claimed without them.
+    extracted_files     INTEGER CHECK (
+                            (extracted_files IS NULL AND extract_status IS NOT 'done')
+                            OR COALESCE(extracted_files, -1) >= 0),
+    extracted_bytes     INTEGER CHECK (
+                            (extracted_bytes IS NULL AND extract_status IS NOT 'done')
+                            OR COALESCE(extracted_bytes, -1) >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS files_by_status ON files (status);
 CREATE INDEX IF NOT EXISTS files_by_last_seen_run ON files (last_seen_run);
 CREATE INDEX IF NOT EXISTS listings_by_last_run ON listings (last_run);
 CREATE INDEX IF NOT EXISTS files_by_listing ON files (listing_url);
+CREATE INDEX IF NOT EXISTS files_by_extract_status ON files (extract_status);

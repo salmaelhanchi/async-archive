@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from typing import Protocol
 
+from archive_mirror.domain.extraction import ExtractResult
 from archive_mirror.domain.models import (
     ChecksumRef,
     DownloadedFile,
@@ -13,7 +14,7 @@ from archive_mirror.domain.models import (
     RemoteFile,
     TransferResult,
 )
-from archive_mirror.domain.status import FileStatus
+from archive_mirror.domain.status import ExtractStatus, FileStatus
 
 
 class PageFetcher(Protocol):
@@ -64,3 +65,23 @@ class DownloadStateWriter(Protocol):
     ) -> None: ...
 
     async def mark_done(self, file_id: str, proof: DownloadedFile) -> None: ...
+
+
+class ArchiveExtractor(Protocol):
+    async def extract(self, relative_path: str, name: str) -> ExtractResult:
+        """Unpack the mirrored archive at ``relative_path``. Raises ``UnsupportedArchive``
+        or ``ExtractionFailed`` for archives that cannot be unpacked."""
+        ...
+
+
+class ExtractStateWriter(Protocol):
+    async def extract_transition(
+        self,
+        file_id: str,
+        current: ExtractStatus,
+        target: ExtractStatus,
+        *,
+        error: str | None = None,
+    ) -> None: ...
+
+    async def mark_extracted(self, file_id: str, result: ExtractResult) -> None: ...

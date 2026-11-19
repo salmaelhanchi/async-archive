@@ -1,6 +1,6 @@
 """SQLite state (via aiosqlite): runs, listings and files, with status ``CHECK``s.
 
-One connection per run. Every write runs inside ``_transaction``: an ``asyncio.Lock`` makes
+One connection per run. Every write runs inside ``transaction``: an ``asyncio.Lock`` makes
 transactions take turns, so a download worker's commit can never commit half of the
 listing writer's batch (see ADR 004). Every write method commits before returning, so
 anything a caller reports has already reached disk ("durable before visible").
@@ -28,9 +28,16 @@ from archive_mirror.domain.models import (
     RemoteFile,
     RunSummary,
 )
-from archive_mirror.domain.status import FileStatus, ListingStatus, RunOutcome, check_transition
+from archive_mirror.domain.status import (
+    ExtractStatus,
+    FileStatus,
+    ListingStatus,
+    RunOutcome,
+    check_extract_transition,
+    check_transition,
+)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _now() -> str:
@@ -79,8 +86,13 @@ class SqliteStateStore:
     async def close(self) -> None:
         await self._db.close()
 
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        """For reads. Writes go through ``transaction``."""
+        return self._db
+
     @asynccontextmanager
-    async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
         async with self._lock:
             try:
                 yield self._db
@@ -94,7 +106,7 @@ class SqliteStateStore:
     async def start_run(
         self, *, mode: str, start_urls: Sequence[str], config: dict[str, Any], tool_version: str
     ) -> None:
-        async with self._transaction() as db:
+        async with self.transaction() as db:
             await db.execute(
                 sql.INSERT_RUN,
                 (
@@ -108,14 +120,15 @@ class SqliteStateStore:
                 ),
             )
 
-    async def recover_interrupted(self) -> tuple[int, int]:
+    async def recover_interrupted(self) -> tuple[int, int, int]:
         """Clean up after a process that was killed. Call only while holding the state lock.
 
-        Earlier runs still marked ``running`` become ``interrupted``, and files left in
-        ``downloading`` go back to ``listed``; their ``.part`` files are resumed later.
-        Returns ``(runs, files)`` recovered.
+        Earlier runs still marked ``running`` become ``interrupted``, files left in
+        ``downloading`` go back to ``listed`` (their ``.part`` files are resumed later), and
+        archives left in ``extracting`` go back to ``pending``.
+        Returns ``(runs, files, archives)`` recovered.
         """
-        async with self._transaction() as db:
+        async with self.transaction() as db:
             runs = await db.execute(
                 "UPDATE runs SET outcome = 'interrupted', finished_at = ?"
                 " WHERE outcome = 'running' AND run_id != ?",
@@ -127,10 +140,17 @@ class SqliteStateStore:
                 " last_error = 'interrupted, will resume' WHERE status = 'downloading'",
                 (_now(),),
             )
-        return runs.rowcount, files.rowcount
+            check_extract_transition(ExtractStatus.EXTRACTING, ExtractStatus.PENDING)
+            archives = await db.execute(
+                "UPDATE files SET extract_status = 'pending', updated_at = ?,"
+                " extract_error = 'interrupted, will extract again'"
+                " WHERE extract_status = 'extracting'",
+                (_now(),),
+            )
+        return runs.rowcount, files.rowcount, archives.rowcount
 
     async def finish_run(self, outcome: RunOutcome) -> None:
-        async with self._transaction() as db:
+        async with self.transaction() as db:
             await db.execute(
                 "UPDATE runs SET outcome = ?, finished_at = ? WHERE run_id = ?",
                 (outcome.value, _now(), self.run_id),
@@ -143,7 +163,7 @@ class SqliteStateStore:
     ) -> list[PendingFile]:
         """Store a listing and its files in one transaction. Returns the files not yet done."""
         now = _now()
-        async with self._transaction() as db:
+        async with self.transaction() as db:
             await db.execute(
                 sql.UPSERT_LISTING,
                 (
@@ -207,7 +227,7 @@ class SqliteStateStore:
         if target is FileStatus.DONE:
             raise InvalidTransition("use mark_done to finish a file")
         check_transition(current, target)
-        async with self._transaction() as db:
+        async with self.transaction() as db:
             cursor = await db.execute(
                 "UPDATE files SET status = ?, last_error = ?, updated_at = ?,"
                 " attempts = attempts + (? = 'downloading')"
@@ -218,12 +238,15 @@ class SqliteStateStore:
                 raise InvalidTransition(f"{file_id} is not in status {current}")
 
     async def mark_done(self, file_id: str, proof: DownloadedFile) -> None:
-        """``downloading -> done``, with the digest and size that justify it."""
+        """``downloading -> done``, with the digest and size that justify it. A new copy of
+        an archive is (re)queued for extraction in the same commit."""
         check_transition(FileStatus.DOWNLOADING, FileStatus.DONE)
-        async with self._transaction() as db:
+        async with self.transaction() as db:
             cursor = await db.execute(
                 "UPDATE files SET status = 'done', sha256 = ?, bytes_on_disk = ?,"
-                " verified_by = ?, etag = ?, done_run = ?, last_error = NULL, updated_at = ?"
+                " verified_by = ?, etag = ?, done_run = ?, last_error = NULL, updated_at = ?,"
+                " extract_status = CASE WHEN is_archive = 1 THEN 'pending' END,"
+                " extract_error = NULL, extracted_files = NULL, extracted_bytes = NULL"
                 " WHERE file_id = ? AND status = 'downloading'",
                 (
                     proof.sha256,

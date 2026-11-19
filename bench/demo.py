@@ -2,6 +2,7 @@
 
     uv run python -m bench.demo --style iis --workers 8              # dry run
     uv run python -m bench.demo --mirror --max-size 2000000 --checksums  # download everything
+    uv run python -m bench.demo --mirror --real-archives --progress  # and unpack the archives
 
 Starts the server on a free port, runs ``archive-mirror mirror <url>`` in a child process
 with its own state database and mirror directory, prints the CLI's summary, stops the server.
@@ -26,6 +27,7 @@ async def run(args: argparse.Namespace) -> int:
         files_per_dir=args.files,
         max_size=args.max_size,
         checksums=args.checksums,
+        real_archives=args.real_archives,
     )
     archive = Archive(spec)
     config = ServerConfig(args.style, spec, args.latency_ms, body_rate=args.body_rate)
@@ -45,6 +47,7 @@ async def run(args: argparse.Namespace) -> int:
     env = os.environ | {
         "ARCHIVE_MIRROR_STATE_DB": str(state_dir / f"demo-{mode}-{args.style}.sqlite"),
         "ARCHIVE_MIRROR_MIRROR_ROOT": str(state_dir / f"demo-mirror-{args.style}"),
+        "ARCHIVE_MIRROR_EXTRACT_ROOT": str(state_dir / f"demo-extracted-{args.style}"),
         "ARCHIVE_MIRROR_LISTING_WORKERS": str(args.workers),
         "ARCHIVE_MIRROR_DOWNLOAD_WORKERS": str(args.workers),
         "ARCHIVE_MIRROR_MAX_IN_FLIGHT": str(args.workers),
@@ -61,6 +64,7 @@ async def run(args: argparse.Namespace) -> int:
             f"http://127.0.0.1:{port}/",
             *([] if args.mirror else ["--dry-run"]),
             *(["--json"] if args.json else []),
+            *(["--progress"] if args.progress else []),
             env=env,
         )
         return await process.wait()
@@ -77,6 +81,8 @@ def main() -> None:
     parser.add_argument("--files", type=int, default=25)
     parser.add_argument("--max-size", type=int, default=5_000_000)
     parser.add_argument("--checksums", action="store_true", help="publish .sha256 sidecars")
+    parser.add_argument("--real-archives", action="store_true", help="real .tar.gz files")
+    parser.add_argument("--progress", action="store_true", help="show the live progress bars")
     parser.add_argument("--latency-ms", type=int, default=20)
     parser.add_argument("--body-rate", type=int, default=None, help="bytes/s per response")
     parser.add_argument("--workers", type=int, default=8)

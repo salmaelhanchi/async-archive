@@ -9,6 +9,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "httpx[http2]>=0.27",
     "prometheus-client>=0.20",
+    "py7zr>=0.22",
     "pydantic-settings>=2.4",
     "rich>=13.7",
     # httpcore imports sniffio on every request to detect the event loop. Without it each
@@ -54,6 +55,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105"]
 "bench/**" = ["S104"]
+# Fixed SQL text assembled from constants; values always go through placeholders.
+"src/archive_mirror/adapters/state_sql.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.12"

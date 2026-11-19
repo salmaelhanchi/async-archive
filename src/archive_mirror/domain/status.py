@@ -40,7 +40,42 @@ FILE_TRANSITIONS: Mapping[FileStatus, frozenset[FileStatus]] = {
 }
 
 
+class ExtractStatus(enum.StrEnum):
+    """Second state machine, for archives only. It starts when the download is done."""
+
+    PENDING = "pending"
+    EXTRACTING = "extracting"
+    DONE = "done"
+    FAILED = "failed"
+    UNSUPPORTED = "unsupported"
+
+
+EXTRACT_TRANSITIONS: Mapping[ExtractStatus, frozenset[ExtractStatus]] = {
+    ExtractStatus.PENDING: frozenset({ExtractStatus.EXTRACTING}),
+    # PENDING from EXTRACTING: interrupted, the half-written directory is discarded next time.
+    ExtractStatus.EXTRACTING: frozenset(
+        {
+            ExtractStatus.DONE,
+            ExtractStatus.FAILED,
+            ExtractStatus.UNSUPPORTED,
+            ExtractStatus.PENDING,
+        }
+    ),
+    # A failure is retried by a later run, like a failed download: it may have been local
+    # (disk full). done and unsupported are left only when a new copy of the archive is
+    # downloaded, which sets ``pending`` again together with ``done`` for the file.
+    ExtractStatus.FAILED: frozenset({ExtractStatus.EXTRACTING}),
+    ExtractStatus.DONE: frozenset(),
+    ExtractStatus.UNSUPPORTED: frozenset(),
+}
+
+
 def check_transition(current: FileStatus, target: FileStatus) -> None:
     """Raise ``InvalidTransition`` unless ``current -> target`` is allowed."""
     if target not in FILE_TRANSITIONS[current]:
         raise InvalidTransition(f"{current} -> {target} is not allowed")
+
+
+def check_extract_transition(current: ExtractStatus, target: ExtractStatus) -> None:
+    if target not in EXTRACT_TRANSITIONS[current]:
+        raise InvalidTransition(f"extract {current} -> {target} is not allowed")

@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     )
     min_free_bytes: int = Field(default=1024**3, ge=0, description="free disk to keep")
 
+    # extraction: archives are unpacked in worker processes, off the event loop
+    extract: bool = True
+    extract_root: Path = Path("data/extracted")
+    extract_workers: int = Field(default=2, ge=1, le=64, description="worker processes")
+    extract_queue_size: int = Field(default=16, ge=1)
+    max_extract_bytes: int = Field(default=20 * 1024**3, ge=1, description="per archive")
+    max_extract_members: int = Field(default=100_000, ge=1, description="per archive")
+
     # retries
     request_timeout_s: float = Field(default=30.0, gt=0)
     max_attempts: int = Field(default=5, ge=1)

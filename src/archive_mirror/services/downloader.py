@@ -9,10 +9,15 @@ Shape of the pipeline::
         4. verify size, and checksum if published  hashing runs in a thread
         5. fsync + atomic rename to <path>
         6. downloading -> done, with sha256 + size committed; then counters and logs move
+        7. an archive is handed to the extract queue (bounded too)
 
 A file is ``done`` only after its bytes are at the final path, so a kill between 5 and 6
 costs one re-download, never a missing file. A kill anywhere else leaves a ``.part`` that
 the next run resumes (see ADR 004).
+
+Cancellation (Ctrl+C, see ADR 005): during 1-4 the row is rolled back to ``listed`` and the
+``.part`` stays for the range resume. Steps 5-6 are short and are shielded: once a file is
+verified, a cancellation waits for it to be finished and recorded.
 
 The queue is bounded, so the listing writer blocks when downloads fall behind, which in
 turn blocks the listers: memory stays flat however large the archive is.
@@ -27,6 +32,7 @@ import structlog
 from archive_mirror import metrics
 from archive_mirror.domain.errors import FetchFailed, InvalidTransition, VerificationFailed
 from archive_mirror.domain.models import (
+    ArchiveJob,
     DownloadedFile,
     DownloadReport,
     PendingFile,
@@ -34,13 +40,14 @@ from archive_mirror.domain.models import (
     TransferResult,
 )
 from archive_mirror.domain.sizes import size_matches
-from archive_mirror.domain.status import FileStatus
+from archive_mirror.domain.status import ExtractStatus, FileStatus
 from archive_mirror.services.ports import (
     ChecksumSource,
     DownloadStateWriter,
     FileTransfer,
     PartStorage,
 )
+from archive_mirror.services.writes import claim, write_through
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +58,13 @@ class DownloadLimits:
     min_free_bytes: int  # never let a download take the disk below this
 
 
+OnArchive = Callable[[ArchiveJob], Awaitable[None]]
+
+
 @dataclass
 class DownloadStats:
+    queued: int = 0
+    queued_bytes: int = 0  # listed sizes of queued files
     done: int = 0
     failed: int = 0
     skipped: int = 0
@@ -108,12 +120,14 @@ class Downloader:
         checksums: ChecksumSource,
         state: DownloadStateWriter,
         limits: DownloadLimits,
+        on_archive: OnArchive | None = None,
     ) -> None:
         self._transfer = transfer
         self._storage = storage
         self._checksums = checksums
         self._state = state
         self._limits = limits
+        self._on_archive = on_archive
         self._queue: asyncio.Queue[PendingFile | None] = asyncio.Queue(limits.queue_size)
         self._budget_used = 0  # listed bytes of every download started this run
         self._in_flight_bytes = 0  # listed bytes of downloads not finished yet
@@ -134,6 +148,8 @@ class Downloader:
         """Queue files for download. Blocks while the queue is full (backpressure)."""
         for item in files:
             await self._queue.put(item)
+            self.stats.queued += 1
+            self.stats.queued_bytes += item.file.size_bytes or 0
             metrics.QUEUE_DEPTH.labels(queue="downloads").set(self._queue.qsize())
 
     async def submit_all(self, files: AsyncIterable[PendingFile]) -> None:
@@ -168,7 +184,10 @@ class Downloader:
         self._budget_used += reserved
         self._in_flight_bytes += reserved
         try:
-            await self._state.transition(file.file_id, item.status, FileStatus.DOWNLOADING)
+            await claim(
+                self._state.transition(file.file_id, item.status, FileStatus.DOWNLOADING),
+                undo=lambda: self._roll_back(file),
+            )
         except InvalidTransition as exc:  # the row moved on since it was queued
             self._budget_used -= reserved
             self._in_flight_bytes -= reserved
@@ -179,17 +198,17 @@ class Downloader:
         except (FetchFailed, VerificationFailed, OSError) as exc:
             # OSError: a local problem with this one file (path too long, permissions).
             # It fails the file, not the run; the next run tries it again.
-            reason = _failure_reason(exc)
-            await self._state.transition(
-                file.file_id, FileStatus.DOWNLOADING, FileStatus.FAILED, error=reason
-            )
-            self.stats.failed += 1
-            metrics.FILES_FINISHED.labels(outcome="failed").inc()
-            log.warning("download_failed", reason=reason)
+            await self._fail(file, exc)
             return
+        except asyncio.CancelledError:
+            await self._roll_back(file)
+            raise
         finally:
             self._in_flight_bytes -= reserved
-        await self._state.mark_done(file.file_id, proof)
+
+        # Verified bytes are finished and recorded even if a Ctrl+C arrives meanwhile.
+        if not await write_through(self._finish(file, proof)):
+            return
         self.stats.done += 1
         self.stats.resumed += result.resumed_from > 0
         self.stats.verified_by_checksum += proof.verified_by == "checksum"
@@ -200,8 +219,41 @@ class Downloader:
             resumed_from=result.resumed_from,
             verified_by=proof.verified_by,
         )
+        if file.is_archive and self._on_archive is not None:
+            job = ArchiveJob(file.file_id, file.relative_path, file.name, ExtractStatus.PENDING)
+            await self._on_archive(job)  # blocks while the extract queue is full
+
+    async def _finish(self, file: RemoteFile, proof: DownloadedFile) -> bool:
+        """fsync + rename, then ``done``. False when the rename failed (the file is failed)."""
+        try:
+            await self._storage.finalize(file.relative_path)
+        except OSError as exc:
+            await self._fail(file, exc)
+            return False
+        await self._state.mark_done(file.file_id, proof)
+        return True
+
+    async def _roll_back(self, file: RemoteFile) -> None:
+        await self._state.transition(
+            file.file_id,
+            FileStatus.DOWNLOADING,
+            FileStatus.LISTED,
+            error="interrupted, will resume",
+        )
+
+    async def _fail(self, file: RemoteFile, exc: Exception) -> None:
+        reason = _failure_reason(exc)
+        await write_through(
+            self._state.transition(
+                file.file_id, FileStatus.DOWNLOADING, FileStatus.FAILED, error=reason
+            )
+        )
+        self.stats.failed += 1
+        metrics.FILES_FINISHED.labels(outcome="failed").inc()
+        self._log.warning("download_failed", url=file.url, reason=reason)
 
     async def _fetch_verified(self, file: RemoteFile) -> tuple[DownloadedFile, TransferResult]:
+        """Bring the part to full length and verify it. Does not finalize."""
         expected = None
         if file.checksum is not None:
             expected = await self._checksums.expected(file.checksum, file.name)
@@ -215,7 +267,6 @@ class Downloader:
             digests = await self._storage.digest_part(file.relative_path, algorithms)
             problem = verification_problem(file, result, digests, expected)
             if problem is None:
-                await self._storage.finalize(file.relative_path)
                 if expected is not None:
                     verified_by = "checksum"
                 elif file.size_exact or result.total is not None:

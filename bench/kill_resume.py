@@ -17,11 +17,14 @@ SQLite at every instant, not the Ctrl+C path.
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
 import random
+import signal
 import sqlite3
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -77,6 +80,9 @@ def _env(work: Path) -> dict[str, str]:
         "ARCHIVE_MIRROR_PER_HOST_BURST": "50",
         "ARCHIVE_MIRROR_MIN_FREE_BYTES": "0",
         "ARCHIVE_MIRROR_LOG_LEVEL": "ERROR",
+        # This harness checks the download path; the synthetic .tar.gz files are random
+        # bytes. Ctrl+C with extraction is tests/integration/test_interrupt_resume.py.
+        "ARCHIVE_MIRROR_EXTRACT": "false",
     }
 
 
@@ -102,14 +108,29 @@ async def run_cli(url: str, work: Path, *, kill_after: float | None) -> bool:
     try:
         await asyncio.wait_for(process.wait(), kill_after)
     except TimeoutError:
-        try:
-            process.kill()
-        except ProcessLookupError:  # it exited on its own as the timer fired
-            await process.wait()
-            return False
+        await asyncio.to_thread(_kill_tree, process.pid)
         await process.wait()
         return True
     return False
+
+
+def _kill_tree(pid: int) -> None:
+    """Hard-kill the CLI and every process it started.
+
+    On Windows a virtualenv's ``python.exe`` is a launcher that starts the real interpreter
+    as its child. Killing only the launcher can leave that child running when the kill lands
+    while the launcher is still starting it (seen once in 20 trials: an orphan that held the
+    test's output pipe open for minutes). ``taskkill /T`` takes the whole tree. A process
+    that exited as the timer fired makes taskkill fail, which is fine.
+    """
+    if sys.platform == "win32":
+        taskkill = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "taskkill.exe"
+        subprocess.run(  # noqa: S603 - fixed program and arguments
+            [str(taskkill), "/F", "/T", "/PID", str(pid)], capture_output=True, check=False
+        )
+    else:
+        with contextlib.suppress(ProcessLookupError):  # exited as the timer fired
+            os.kill(pid, signal.SIGKILL)
 
 
 async def run_trials(

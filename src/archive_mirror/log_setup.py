@@ -8,6 +8,17 @@ from datetime import UTC, datetime
 import structlog
 
 
+class _CurrentStderr:
+    """Writes to whatever ``sys.stderr`` is now. The live progress display swaps it for a
+    proxy that prints above the bars; a logger holding the original would draw through them."""
+
+    def write(self, text: str) -> int:
+        return sys.stderr.write(text)
+
+    def flush(self) -> None:
+        sys.stderr.flush()
+
+
 def new_run_id() -> str:
     """Sortable and unique: UTC start time plus random suffix."""
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
@@ -32,6 +43,6 @@ def configure_logging(*, level: str, json_output: bool, run_id: str) -> None:
         wrapper_class=structlog.make_filtering_bound_logger(
             logging.getLevelNamesMapping()[level.upper()]
         ),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        logger_factory=structlog.PrintLoggerFactory(file=_CurrentStderr()),  # type: ignore[arg-type]
         cache_logger_on_first_use=False,
     )

@@ -172,13 +172,14 @@ async def test_a_failed_write_rolls_back_the_whole_listing(store: SqliteStateSto
 # --- version 2: downloads ---------------------------------------------------------------
 
 
-async def test_a_version_1_file_is_migrated_to_the_same_schema_as_a_new_one(
-    tmp_path: Path,
+@pytest.mark.parametrize("version", [1, 2])
+async def test_an_older_file_is_migrated_to_the_same_schema_as_a_new_one(
+    tmp_path: Path, version: int
 ) -> None:
     old = tmp_path / "old.sqlite"
     with sqlite3.connect(old) as db:
-        db.executescript((FIXTURES / "schema" / "v1.sql").read_text(encoding="utf-8"))
-        db.execute("PRAGMA user_version = 1")
+        db.executescript((FIXTURES / "schema" / f"v{version}.sql").read_text(encoding="utf-8"))
+        db.execute(f"PRAGMA user_version = {version}")
     await (await SqliteStateStore.open(old, "run-a")).close()
     await (await SqliteStateStore.open(tmp_path / "new.sqlite", "run-a")).close()
 
@@ -244,7 +245,7 @@ async def test_recovery_after_a_kill_resets_downloads_and_closes_old_runs(tmp_pa
     status_a = await resumed.file_status(a.file_id)
     await resumed.close()
 
-    assert recovered == (1, 1)
+    assert recovered == (1, 1, 0)
     assert runs == [("run-a", "interrupted"), ("run-b", "running")]
     assert status_a is FileStatus.LISTED
 

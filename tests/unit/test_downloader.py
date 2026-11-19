@@ -7,6 +7,7 @@ import pytest
 
 from archive_mirror.domain.errors import FetchFailed
 from archive_mirror.domain.models import (
+    ArchiveJob,
     ChecksumRef,
     EntryKind,
     Listing,
@@ -16,8 +17,8 @@ from archive_mirror.domain.models import (
     RemoteFile,
     TransferResult,
 )
-from archive_mirror.domain.status import FileStatus
-from archive_mirror.services.downloader import Downloader, DownloadLimits
+from archive_mirror.domain.status import ExtractStatus, FileStatus
+from archive_mirror.services.downloader import Downloader, DownloadLimits, OnArchive
 from tests.fakes import FakeChecksums, FakeStorage, FakeTransfer, MemoryDownloadState
 
 DIR = "https://archive.example/pub/"
@@ -47,6 +48,7 @@ def downloader(
     queue_size: int = 4,
     max_bytes: int | None = None,
     min_free: int = 0,
+    on_archive: OnArchive | None = None,
 ) -> Downloader:
     return Downloader(
         transfer=transfer,
@@ -56,6 +58,7 @@ def downloader(
         limits=DownloadLimits(
             workers=workers, queue_size=queue_size, max_bytes=max_bytes, min_free_bytes=min_free
         ),
+        on_archive=on_archive,
     )
 
 
@@ -221,3 +224,76 @@ async def test_a_bug_in_the_feed_cancels_the_workers() -> None:
     with pytest.raises(ExceptionGroup) as caught:
         await d.run(feed)
     assert caught.group_contains(RuntimeError, match="listing writer crashed")
+
+
+# --- archives and cancellation ----------------------------------------------------------
+
+
+async def test_finished_archives_are_handed_to_the_extract_queue() -> None:
+    archive, plain = remote("data.tar.gz"), remote("notes.txt")
+    handed: list[ArchiveJob] = []
+
+    async def on_archive(job: ArchiveJob) -> None:
+        handed.append(job)
+
+    d = downloader(FakeTransfer({archive.url: [ok()], plain.url: [ok()]}), on_archive=on_archive)
+
+    await run(d, [archive, plain])
+
+    assert handed == [
+        ArchiveJob(archive.file_id, archive.relative_path, "data.tar.gz", ExtractStatus.PENDING)
+    ]
+
+
+class GatedTransfer(FakeTransfer):
+    """A transfer that waits until the test cancels it."""
+
+    def __init__(self) -> None:
+        super().__init__({})
+        self.started = asyncio.Event()
+
+    async def download(self, url: str, relative_path: str) -> TransferResult:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def test_cancellation_mid_transfer_rolls_the_file_back_to_listed() -> None:
+    f = remote("a.bin")
+    transfer, state = GatedTransfer(), MemoryDownloadState()
+    task = asyncio.create_task(run(downloader(transfer, state=state), [f]))
+    await transfer.started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert state.statuses[f.file_id] is FileStatus.LISTED
+    assert state.errors[f.file_id] == "interrupted, will resume"
+
+
+class SlowFinalize(FakeStorage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.renaming = asyncio.Event()
+
+    async def finalize(self, relative_path: str) -> None:
+        self.renaming.set()
+        await asyncio.sleep(0.05)
+        await super().finalize(relative_path)
+
+
+async def test_cancellation_while_finishing_a_verified_file_waits_and_records_it() -> None:
+    f = remote("a.bin")
+    storage, state = SlowFinalize(), MemoryDownloadState()
+    task = asyncio.create_task(
+        run(downloader(FakeTransfer({f.url: [ok()]}), storage=storage, state=state), [f])
+    )
+    await storage.renaming.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert storage.finalized == [f.relative_path]
+    assert state.statuses[f.file_id] is FileStatus.DONE

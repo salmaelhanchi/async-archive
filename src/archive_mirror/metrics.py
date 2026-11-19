@@ -30,6 +30,11 @@ FILES_FINISHED = Counter(
     "Files leaving the download queue, by outcome (done, failed, skipped).",
     ["outcome"],
 )
+ARCHIVES_FINISHED = Counter(
+    "archive_mirror_archives_finished_total",
+    "Archives leaving the extract queue, by outcome (done, failed, unsupported).",
+    ["outcome"],
+)
 
 
 def serve(port: int) -> None:

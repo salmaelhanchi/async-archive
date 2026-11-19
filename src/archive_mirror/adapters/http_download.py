@@ -30,6 +30,7 @@ class HttpFileTransfer:
     def __init__(self, fetcher: HttpFetcher, storage: MirrorStorage) -> None:
         self._fetcher = fetcher
         self._storage = storage
+        self.bytes_received = 0  # across every file of the run, as chunks land (for progress)
 
     async def download(self, url: str, relative_path: str) -> TransferResult:
         storage = self._storage
@@ -88,6 +89,7 @@ class HttpFileTransfer:
                 async for chunk in response.aiter_raw():
                     writer.write(chunk)
                     received += len(chunk)
+                    self.bytes_received += len(chunk)
                     metrics.BYTES_RECEIVED.labels(host=host).inc(len(chunk))
             finally:
                 writer.close()

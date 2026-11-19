@@ -205,6 +205,9 @@ def main() -> None:
     parser.add_argument("--files", type=int, default=25)
     parser.add_argument("--max-size", type=int, default=5_000_000)
     parser.add_argument("--checksums", action="store_true", help="add .sha256 sidecars")
+    parser.add_argument(
+        "--real-archives", action="store_true", help="serve .tar.gz files as real archives"
+    )
     parser.add_argument("--latency-ms", type=int, default=20)
     parser.add_argument("--body-rate", type=int, default=None, help="bytes/s per response")
     parser.add_argument("--seed", type=int, default=7)
@@ -216,6 +219,7 @@ def main() -> None:
         max_size=args.max_size,
         seed=args.seed,
         checksums=args.checksums,
+        real_archives=args.real_archives,
     )
     files = expected_files(Archive(spec).tree)
     print(f"serving {len(files)} files, {sum(files.values()):,} bytes as {args.style} listings")

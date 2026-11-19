@@ -1,6 +1,8 @@
 # Demo: the mirror downloads the local archive server's tree over the compose network,
-# verifies every file against its published .sha256, and keeps state and files in a volume.
-# Run it twice: the second run lists again and downloads nothing.
+# verifies every file against its published .sha256, unpacks the .tar.gz archives in worker
+# processes, and keeps state and files in a volume.
+# Run it twice: the second run lists again and downloads and unpacks nothing.
+# `docker compose stop mirror` mid-run sends SIGTERM: the run stops cleanly and resumes.
 #   docker compose -f deploy/docker-compose.yml up --build --abort-on-container-exit
 services:
   archive:
@@ -18,6 +20,7 @@ services:
       - --files=10
       - --max-size=2000000
       - --checksums
+      - --real-archives
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/robots.txt')"]
       interval: 2s
@@ -34,6 +37,7 @@ services:
     command: ["mirror", "http://archive:8080/"]
     environment:
       ARCHIVE_MIRROR_MIRROR_ROOT: /data/mirror
+      ARCHIVE_MIRROR_EXTRACT_ROOT: /data/extracted
       ARCHIVE_MIRROR_DOWNLOAD_WORKERS: "8"
       ARCHIVE_MIRROR_LISTING_WORKERS: "8"
       ARCHIVE_MIRROR_MAX_IN_FLIGHT: "8"

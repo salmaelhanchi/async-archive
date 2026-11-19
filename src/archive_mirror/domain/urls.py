@@ -100,7 +100,8 @@ def file_id(url: str) -> str:
     return hashlib.sha256(normalize_url(url).encode("utf-8")).hexdigest()
 
 
-def _safe_segment(segment: str) -> str:
+def safe_segment(segment: str) -> str:
+    """One path segment made safe for Windows and POSIX file systems."""
     cleaned = _UNSAFE_CHARS.sub("_", segment).rstrip(" .")
     if cleaned in ("", ".", ".."):
         return "_"
@@ -116,5 +117,5 @@ def local_relative_path(url: str) -> str:
     result can never climb out of the mirror root.
     """
     parts = urlsplit(normalize_url(url))
-    segments = [_safe_segment(unquote(s)) for s in parts.path.split("/") if s]
-    return "/".join([_safe_segment(parts.netloc), *segments])
+    segments = [safe_segment(unquote(s)) for s in parts.path.split("/") if s]
+    return "/".join([safe_segment(parts.netloc), *segments])

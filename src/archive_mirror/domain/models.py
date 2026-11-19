@@ -4,7 +4,7 @@ import enum
 from dataclasses import dataclass
 from datetime import datetime
 
-from archive_mirror.domain.status import FileStatus, ListingStatus
+from archive_mirror.domain.status import ExtractStatus, FileStatus, ListingStatus
 from archive_mirror.domain.urls import file_id, local_relative_path
 
 ARCHIVE_SUFFIXES = (
@@ -197,11 +197,35 @@ class DownloadReport:
 
 
 @dataclass(frozen=True, slots=True)
+class ArchiveJob:
+    """A downloaded archive waiting to be unpacked, with the status it was read in."""
+
+    file_id: str
+    relative_path: str
+    name: str
+    status: ExtractStatus
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractReport:
+    """What the extraction workers did in one run. Counted after each commit."""
+
+    archives_done: int
+    archives_failed: int
+    archives_unsupported: int
+    files_written: int
+    bytes_written: int
+
+
+@dataclass(frozen=True, slots=True)
 class MirrorSummary:
-    """A mirror run: the crawl (absent for ``resume``), the downloads, and the state after."""
+    """A mirror run: the crawl (absent for ``resume``), the downloads, the extraction
+    (absent when it is turned off), and the state after."""
 
     run_id: str
     crawl: RunSummary | None
     downloads: DownloadReport
+    extraction: ExtractReport | None
     files_by_status: dict[FileStatus, int]
     bytes_done: int
+    archives_by_status: dict[ExtractStatus, int]

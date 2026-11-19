@@ -30,6 +30,7 @@ def make_settings(tmp_path: Path) -> SettingsFactory:
         values: dict[str, object] = {
             "state_db": tmp_path / "state.sqlite",
             "mirror_root": tmp_path / "mirror",
+            "extract_root": tmp_path / "extracted",
             "per_host_rate": 500.0,
             "per_host_burst": 50,
             "backoff_base_s": 0.01,

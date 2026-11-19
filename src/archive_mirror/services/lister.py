@@ -51,6 +51,7 @@ class CrawlStats:
         default_factory=lambda: dict.fromkeys(ListingStatus, 0)
     )
     files: int = 0
+    finished: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,7 @@ class Lister:
             for _ in range(self._limits.workers):
                 self._directories.put_nowait(None)
             await self._writes.put(None)
+        self.stats.finished = True
         return self.stats
 
     def _enqueue(self, directory: _Directory) -> None:

@@ -9,8 +9,8 @@ from typer.testing import CliRunner
 from archive_mirror import __version__
 from archive_mirror.adapters.state_lock import exclusive_state
 from archive_mirror.cli import EXIT_LOCKED, app
-from archive_mirror.domain.models import DownloadReport, MirrorSummary
-from archive_mirror.domain.status import FileStatus
+from archive_mirror.domain.models import DownloadReport, ExtractReport, MirrorSummary
+from archive_mirror.domain.status import ExtractStatus, FileStatus
 from archive_mirror.report import human_bytes, to_json
 
 runner = CliRunner()
@@ -64,12 +64,16 @@ def test_json_summary_uses_plain_keys() -> None:
         run_id="r",
         crawl=None,
         downloads=DownloadReport(1, 0, 0, 0, 1, 10),
+        extraction=ExtractReport(1, 0, 0, 3, 30),
         files_by_status=dict.fromkeys(FileStatus, 0) | {FileStatus.DONE: 1},
         bytes_done=10,
+        archives_by_status=dict.fromkeys(ExtractStatus, 0) | {ExtractStatus.DONE: 1},
     )
 
     payload = json.loads(to_json(summary, 1.23456))
 
     assert payload["files_by_status"]["done"] == 1
     assert payload["downloads"]["bytes_received"] == 10
+    assert payload["archives_by_status"]["done"] == 1
+    assert payload["extraction"]["files_written"] == 3
     assert payload["elapsed_s"] == 1.235

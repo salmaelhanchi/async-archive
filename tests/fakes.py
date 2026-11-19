@@ -5,6 +5,7 @@ from collections import Counter
 from collections.abc import Sequence
 
 from archive_mirror.domain.errors import FetchFailed, InvalidTransition
+from archive_mirror.domain.extraction import ExtractResult
 from archive_mirror.domain.models import (
     ChecksumRef,
     DownloadedFile,
@@ -14,7 +15,12 @@ from archive_mirror.domain.models import (
     RemoteFile,
     TransferResult,
 )
-from archive_mirror.domain.status import FileStatus, check_transition
+from archive_mirror.domain.status import (
+    ExtractStatus,
+    FileStatus,
+    check_extract_transition,
+    check_transition,
+)
 
 
 class FakeClock:
@@ -172,3 +178,59 @@ class MemoryDownloadState:
             raise InvalidTransition(f"{file_id} is not in status downloading")
         self.statuses[file_id] = FileStatus.DONE
         self.done[file_id] = proof
+
+
+# --- extraction -------------------------------------------------------------------------
+
+
+class FakeArchiveExtractor:
+    """Scripted outcome per path (default: one file of 10 bytes); can block until released."""
+
+    def __init__(
+        self,
+        outcomes: dict[str, ExtractResult | Exception] | None = None,
+        gate: asyncio.Event | None = None,
+    ) -> None:
+        self.outcomes = outcomes or {}
+        self.gate = gate
+        self.calls: list[str] = []
+        self.started = asyncio.Event()
+
+    async def extract(self, relative_path: str, name: str) -> ExtractResult:
+        self.calls.append(relative_path)
+        self.started.set()
+        if self.gate is not None:
+            await self.gate.wait()
+        outcome = self.outcomes.get(relative_path, ExtractResult(1, 10, 0))
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class MemoryExtractState:
+    """Applies the real extraction state machine to an in-memory table."""
+
+    def __init__(self, statuses: dict[str, ExtractStatus] | None = None) -> None:
+        self.statuses = statuses or {}
+        self.errors: dict[str, str | None] = {}
+        self.results: dict[str, ExtractResult] = {}
+
+    async def extract_transition(
+        self,
+        file_id: str,
+        current: ExtractStatus,
+        target: ExtractStatus,
+        *,
+        error: str | None = None,
+    ) -> None:
+        check_extract_transition(current, target)
+        if self.statuses.get(file_id, ExtractStatus.PENDING) is not current:
+            raise InvalidTransition(f"{file_id} is not in extract status {current}")
+        self.statuses[file_id] = target
+        self.errors[file_id] = error
+
+    async def mark_extracted(self, file_id: str, result: ExtractResult) -> None:
+        if self.statuses.get(file_id) is not ExtractStatus.EXTRACTING:
+            raise InvalidTransition(f"{file_id} is not in extract status extracting")
+        self.statuses[file_id] = ExtractStatus.DONE
+        self.results[file_id] = result

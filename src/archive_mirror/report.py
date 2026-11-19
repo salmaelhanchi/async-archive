@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.table import Table
 
 from archive_mirror.domain.models import MirrorSummary, RunSummary
-from archive_mirror.domain.status import FileStatus, ListingStatus
+from archive_mirror.domain.status import ExtractStatus, FileStatus, ListingStatus
 
 
 def human_bytes(count: int) -> str:
@@ -72,9 +72,27 @@ def render_mirror(summary: MirrorSummary, elapsed: float, console: Console) -> N
     table.add_row("State: failed", f"{by_status[FileStatus.FAILED]:,}")
     pending = by_status[FileStatus.LISTED] + by_status[FileStatus.DOWNLOADING]
     table.add_row("State: still to download", f"{pending:,}")
+    _extraction_rows(table, summary)
     rate = d.files_done / elapsed if elapsed > 0 else 0.0
     table.add_row("Elapsed", f"{elapsed:.2f} s ({rate:.1f} files/s)")
     console.print(table)
+
+
+def _extraction_rows(table: Table, summary: MirrorSummary) -> None:
+    archives = summary.archives_by_status
+    if summary.extraction is None and not any(archives.values()):
+        return
+    table.add_section()
+    if (e := summary.extraction) is not None:
+        table.add_row("Unpacked this run", f"{e.archives_done:,} archives")
+        table.add_row("  files written", f"{e.files_written:,} ({human_bytes(e.bytes_written)})")
+        table.add_row("  failed", f"{e.archives_failed:,}")
+        table.add_row("  format not supported", f"{e.archives_unsupported:,}")
+    else:
+        table.add_row("Unpacking", "off (ARCHIVE_MIRROR_EXTRACT=false)")
+    waiting = archives[ExtractStatus.PENDING] + archives[ExtractStatus.EXTRACTING]
+    table.add_row("State: archives unpacked", f"{archives[ExtractStatus.DONE]:,}")
+    table.add_row("State: archives to unpack", f"{waiting + archives[ExtractStatus.FAILED]:,}")
 
 
 def _plain(value: Any) -> Any:

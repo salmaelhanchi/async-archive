@@ -23,5 +23,13 @@ class VerificationFailed(Exception):
     """A downloaded file does not match its listed size or its published checksum."""
 
 
+class ExtractionFailed(Exception):
+    """An archive is corrupt, encrypted, or over the extraction limits."""
+
+
+class UnsupportedArchive(ExtractionFailed):
+    """An archive format this tool recognises but does not unpack."""
+
+
 class StateLocked(Exception):
     """Another process is already using this state database."""
