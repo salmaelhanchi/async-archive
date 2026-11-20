@@ -1,11 +1,13 @@
 """Pure rules: URLs, sizes, backoff and the status state machine."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from archive_mirror.adapters.storage import safe_join
 from archive_mirror.domain.backoff import backoff_delay, parse_retry_after
 from archive_mirror.domain.errors import InvalidTransition
 from archive_mirror.domain.models import is_archive
@@ -71,6 +73,8 @@ def test_local_path_never_escapes_the_mirror_root(url: str) -> None:
     parts = path.split("/")
     assert all(part not in ("", ".", "..") for part in parts)
     assert not any(c in path for c in '\\:*?"<>|')
+    root = Path("mirror-root")
+    assert safe_join(root, path).relative_to(root).as_posix() == path  # accepted unchanged
 
 
 def test_local_path_decodes_names_and_keeps_the_host() -> None:

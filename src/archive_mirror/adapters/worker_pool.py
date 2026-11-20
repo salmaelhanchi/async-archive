@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from archive_mirror.adapters.archive_extract import extract_archive
-from archive_mirror.adapters.storage import MirrorStorage
+from archive_mirror.adapters.storage import MirrorStorage, safe_join
 from archive_mirror.domain.errors import ExtractionFailed
 from archive_mirror.domain.extraction import ExtractLimits, ExtractResult
 
@@ -59,10 +59,7 @@ class PoolArchiveExtractor:
         self._limits = limits
 
     def target(self, relative_path: str) -> Path:
-        target = (self._root / relative_path).resolve()
-        if not target.is_relative_to(self._root):  # relative paths are made safe upstream too
-            raise ValueError(f"path escapes the extract root: {relative_path!r}")
-        return target
+        return safe_join(self._root, relative_path)
 
     async def extract(self, relative_path: str, name: str) -> ExtractResult:
         source = str(self._storage.path(relative_path))

@@ -21,7 +21,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
 PART_SUFFIX = ".part"
@@ -63,10 +63,7 @@ class MirrorStorage:
         self.root = root.resolve()
 
     def path(self, relative_path: str) -> Path:
-        target = (self.root / relative_path).resolve()
-        if not target.is_relative_to(self.root):  # relative paths are made safe upstream too
-            raise ValueError(f"path escapes the mirror root: {relative_path!r}")
-        return target
+        return safe_join(self.root, relative_path)
 
     def _part(self, relative_path: str) -> Path:
         target = self.path(relative_path)
@@ -138,6 +135,27 @@ class MirrorStorage:
     def free_bytes(self) -> int:
         self.root.mkdir(parents=True, exist_ok=True)
         return shutil.disk_usage(self.root).free
+
+
+def safe_join(root: Path, relative_path: str) -> Path:
+    """``root / relative_path``, refusing anything that could leave ``root``.
+
+    Purely lexical. An earlier version compared ``resolve()`` results, which reads the file
+    system: on Windows, resolving a path that did not exist yet while another worker process
+    renamed directories beside it sometimes returned a different prefix, and a valid path was
+    rejected. Relative paths are made safe upstream (``local_relative_path``); this is the
+    second line of defence, and it needs no disk access to say no.
+    """
+    pure = PurePosixPath(relative_path)
+    if (
+        not relative_path
+        or pure.is_absolute()
+        or "\\" in relative_path
+        or ":" in relative_path
+        or any(part in ("", ".", "..") for part in relative_path.split("/"))
+    ):
+        raise ValueError(f"path escapes the root: {relative_path!r}")
+    return root.joinpath(*pure.parts)
 
 
 def _hash_file(path: Path, algorithms: frozenset[str]) -> dict[str, str]:

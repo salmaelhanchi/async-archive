@@ -76,9 +76,18 @@ async def test_finalize_renames_and_cleans_up(storage: MirrorStorage) -> None:
     assert sorted(p.name for p in storage.path(REL).parent.iterdir()) == ["data.bin"]
 
 
-def test_paths_cannot_leave_the_root(storage: MirrorStorage) -> None:
+@pytest.mark.parametrize(
+    "bad", ["../outside", "a/../../b", "/etc/passwd", "C:/x", "a\\b", "a//b", "./a", ""]
+)
+def test_paths_cannot_leave_the_root(storage: MirrorStorage, bad: str) -> None:
     with pytest.raises(ValueError, match="escapes"):
-        storage.path("../outside")
+        storage.path(bad)
+
+
+def test_path_checks_do_not_touch_the_disk(storage: MirrorStorage) -> None:
+    # Lexical on purpose: a missing root still answers, so there is no race with other processes.
+    assert not storage.root.exists()
+    assert storage.path("h/a b/x.bin") == storage.root / "h" / "a b" / "x.bin"
 
 
 # --- transfer ---------------------------------------------------------------------------
