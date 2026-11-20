@@ -13,7 +13,7 @@ from archive_mirror.adapters.checksum_source import HttpChecksumSource
 from archive_mirror.adapters.extract_state import SqliteExtractState
 from archive_mirror.adapters.http_download import HttpFileTransfer
 from archive_mirror.adapters.http_fetcher import HttpFetcher, RetryPolicy
-from archive_mirror.adapters.listing import parse_listing
+from archive_mirror.adapters.listing_parser import PooledListingParser
 from archive_mirror.adapters.politeness import HostLimiter
 from archive_mirror.adapters.robots import RobotsPolicy
 from archive_mirror.adapters.state_lock import exclusive_state
@@ -21,7 +21,7 @@ from archive_mirror.adapters.state_store import SqliteStateStore
 from archive_mirror.adapters.storage import MirrorStorage
 from archive_mirror.adapters.worker_pool import PoolArchiveExtractor, worker_pool
 from archive_mirror.domain.extraction import ExtractLimits
-from archive_mirror.domain.models import Listing, MirrorSummary, RunSummary
+from archive_mirror.domain.models import MirrorSummary, RunSummary
 from archive_mirror.domain.status import RunOutcome
 from archive_mirror.progress import ProgressSink, ProgressSnapshot
 from archive_mirror.services.downloader import Downloader, DownloadLimits, DownloadStats
@@ -99,18 +99,24 @@ async def _http(settings: Settings) -> AsyncIterator[tuple[HttpFetcher, RobotsPo
         yield fetcher, policy
 
 
+@asynccontextmanager
+async def _parser(settings: Settings) -> AsyncIterator[PooledListingParser]:
+    """Its own pool, so a long extraction never delays a listing. Workers start on first
+    use (spawn context), so a crawl of small pages never pays for them."""
+    async with worker_pool(settings.parse_workers) as pool:
+        yield PooledListingParser(
+            pool, forced=settings.forced_format, min_pool_bytes=settings.parse_in_pool_min_bytes
+        )
+
+
 def _lister(
     settings: Settings,
     fetcher: HttpFetcher,
     policy: RobotsPolicy,
     store: SqliteStateStore,
+    parse: PooledListingParser,
     on_recorded: OnRecorded | None = None,
 ) -> Lister:
-    forced = settings.forced_format
-
-    def parse(html: str, listing_url: str) -> Listing:
-        return parse_listing(html, listing_url, forced)
-
     return Lister(
         fetcher=fetcher,
         parse=parse,
@@ -169,8 +175,8 @@ async def _reporting(
 async def run_dry_run(settings: Settings, start_urls: Sequence[str], run_id: str) -> RunSummary:
     """List everything under ``start_urls``, record it, and return the totals. No downloads."""
     async with _state(settings, run_id, "dry_run", start_urls) as store:
-        async with _http(settings) as (fetcher, policy):
-            await _lister(settings, fetcher, policy, store).crawl(start_urls)
+        async with _http(settings) as (fetcher, policy), _parser(settings) as parse:
+            await _lister(settings, fetcher, policy, store, parse).crawl(start_urls)
         return await store.run_summary()
 
 
@@ -232,6 +238,7 @@ async def run_mirror(
         storage = MirrorStorage(settings.mirror_root)
         async with (
             _http(settings) as (fetcher, policy),
+            _parser(settings) as parse,
             _extractor(settings, storage, extract_state) as extractor,
         ):
             transfer = HttpFileTransfer(fetcher, storage)
@@ -250,7 +257,9 @@ async def run_mirror(
             )
             lister = None
             if start_urls:
-                lister = _lister(settings, fetcher, policy, store, on_recorded=downloader.submit)
+                lister = _lister(
+                    settings, fetcher, policy, store, parse, on_recorded=downloader.submit
+                )
             pipeline = _Pipeline(transfer, downloader, lister, extractor)
 
             async def downloads() -> DownloadStats:

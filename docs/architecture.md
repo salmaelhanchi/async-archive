@@ -149,7 +149,8 @@ this is for hard kills.
 * Rate vs concurrency for downloads: a download holds its in-flight slot for as long as its
   body streams, so `max_in_flight` caps open connections, while the token bucket still
   caps how many requests start per second.
-* CPU off the loop: hashing a finished file runs in `asyncio.to_thread`. Writes of each
+* CPU off the loop: listing pages of 8 KiB or more are parsed in a process pool (ADR 006);
+  hashing a finished file runs in `asyncio.to_thread`. Writes of each
   network read stay on the loop: they land in the page cache in microseconds. fsync and
   rename run in a thread. Unpacking runs in a `ProcessPoolExecutor` (`spawn`), because the
   decoders hold the GIL. The pool shuts down from a thread, so the loop stays responsive.
@@ -184,10 +185,14 @@ stop could leave a claimed row behind. See [ADR 005](adr/005-graceful-shutdown-a
 * Against the local server (85 listings, 2,125 files, 20 ms latency), wall time stops falling
   after 4 workers. Process CPU time equals wall time at that point (1.67 s CPU, 1.71 s wall),
   so the event loop is CPU-bound. The cost is mostly HTML parsing and URL handling, about 5 ms per
-  25-entry page. More concurrency cannot help a CPU-bound loop. Measured in M2: parsing a 25-entry page
-  costs 4-5 ms for nginx and IIS and about 20 ms for Apache; in a pool of 4 an Apache page
-  costs 7.4 ms of wall time after 1.3 s of process start. Parsing stays on the loop until
-  the M3 benchmark shows where a pool pays off (ADR 005).
+  25-entry page. More concurrency cannot help a CPU-bound loop.
+* Measured in M3 (`bench/parse_cost.py`): parsing costs about 1.5 to 2 ms per KiB of nginx or
+  IIS HTML and 3 to 4 ms per KiB of Apache HTML, so a 1,000-entry Apache page held the loop for
+  0.8 s. Pages of 8 KiB or more are now parsed in their own process pool. In a dry run of
+  nine 1,000-entry directories the worst loop stall fell from 2.9 s to 0.23 s
+  ([ADR 006](adr/006-large-listings-parse-in-a-process-pool.md)).
+* Under the politeness cap the network is the limit, not the CPU: from 4 workers on, a run
+  sits at the cap's ceiling (README benchmark).
 * Profiling also found httpcore re-importing a missing `sniffio` on every request (about 1.1 s per
   400 requests). `sniffio` is now an explicit dependency, see `pyproject.toml`.
 

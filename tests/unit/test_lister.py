@@ -9,10 +9,15 @@ from bench.tree import TreeSpec, build_tree, expected_files
 
 from archive_mirror.adapters.listing import parse_listing
 from archive_mirror.domain.errors import FetchFailed
-from archive_mirror.domain.models import FetchedPage, PendingFile
+from archive_mirror.domain.models import FetchedPage, Listing, PendingFile
 from archive_mirror.domain.status import ListingStatus
 from archive_mirror.services.lister import CrawlLimits, Lister, OnRecorded
 from tests.fakes import AllowPolicy, FakeFetcher, MemoryWriter, html_page
+
+
+async def parse_inline(html: str, listing_url: str) -> Listing:
+    return parse_listing(html, listing_url)
+
 
 ROOT = "https://archive.example/"
 SPEC = TreeSpec(depth=2, dirs_per_dir=2, files_per_dir=3)  # 7 directories, 21 files
@@ -39,7 +44,7 @@ def make_lister(
 ) -> Lister:
     return Lister(
         fetcher=fetcher,
-        parse=parse_listing,
+        parse=parse_inline,
         policy=policy or AllowPolicy(),
         writer=writer,
         limits=CrawlLimits(

@@ -19,11 +19,14 @@ FILES = expected_files(TREE)
 
 
 @pytest.mark.parametrize("style", STYLES)
+@pytest.mark.parametrize("in_pool", [False, True], ids=["parse-on-loop", "parse-in-pool"])
 async def test_dry_run_finds_every_file_in_each_format(
-    style: str, settings: SettingsFactory
+    style: str, in_pool: bool, settings: SettingsFactory
 ) -> None:
+    # threshold 0 sends every page through real worker processes (spawned, pickled both ways)
+    config = settings(parse_in_pool_min_bytes=0) if in_pool else settings()
     async with archive(ServerConfig(style=style, tree=SPEC)) as server:
-        summary = await run_dry_run(settings(), [str(server.make_url("/"))], "run-1")
+        summary = await run_dry_run(config, [str(server.make_url("/"))], "run-1")
 
     assert summary.files == len(FILES) == 52
     assert summary.listings[ListingStatus.LISTED] == len(TREE) == 13

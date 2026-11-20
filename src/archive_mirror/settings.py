@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     )
     min_free_bytes: int = Field(default=1024**3, ge=0, description="free disk to keep")
 
+    # listing pages at least this large are parsed in worker processes (ADR 006)
+    parse_workers: int = Field(default=2, ge=1, le=64, description="worker processes")
+    parse_in_pool_min_bytes: int = Field(default=8 * 1024, ge=0)
+
     # extraction: archives are unpacked in worker processes, off the event loop
     extract: bool = True
     extract_root: Path = Path("data/extracted")

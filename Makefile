@@ -1,4 +1,4 @@
-.PHONY: dev lint format types test test-unit test-integration demo demo-mirror interrupt-resume kill-resume docker-demo clean
+.PHONY: dev lint format types test test-unit test-integration demo demo-mirror interrupt-resume kill-resume bench parse-cost docker-demo clean
 
 dev:  ## install everything and the git hooks
 	uv sync
@@ -38,5 +38,12 @@ kill-resume:  ## M1 proof: kill the CLI at random moments 20 times, resume, comp
 docker-demo:  ## the same, in containers
 	docker compose -f deploy/docker-compose.yml up --build --abort-on-container-exit --exit-code-from mirror
 
+bench:  ## M3: sequential baseline vs the asyncio mirror under one politeness cap, then the chart
+	uv run python -m bench.benchmark --rounds 3
+	uv run python -m bench.chart
+
+parse-cost:  ## listing parse time on the event loop vs a process pool
+	uv run python -m bench.parse_cost
+
 clean:
-	rm -rf data/demo-* data/kill-resume data/extracted .pytest_cache .mypy_cache .ruff_cache
+	rm -rf data/demo-* data/kill-resume data/extracted data/benchmark .pytest_cache .mypy_cache .ruff_cache

@@ -22,7 +22,9 @@ class PageFetcher(Protocol):
 
 
 class ListingParserFn(Protocol):
-    def __call__(self, html: str, listing_url: str) -> Listing: ...
+    async def __call__(self, html: str, listing_url: str) -> Listing:
+        """Async so a large page can be parsed in another process (ADR 006)."""
+        ...
 
 
 class FetchPolicy(Protocol):

@@ -7,11 +7,59 @@ backpressure, per-host rate limits kept separate from concurrency limits, robots
 verification, archives unpacked in worker processes off the event loop, a two-step Ctrl+C,
 and durable SQLite state that makes every rerun idempotent.
 
-**Status: milestones M0, M1 and M2 are done.** It lists three server formats, downloads with
+**Status: milestones M0 to M3 are done.** It lists three server formats, downloads with
 range resume and verification, and unpacks zip, tar and 7z archives in a process pool. It
-survives `kill -9` at any instant (20/20 randomized kill-and-resume trials, byte for byte)
-and stops cleanly on Ctrl+C or `docker stop`, with nothing left for the next run to
-recover. Next: a benchmark against the sequential original (M3).
+survives `kill -9` at any instant (20/20 randomized kill-and-resume trials, byte for byte),
+stops cleanly on Ctrl+C or `docker stop`, and mirrors **2.7x faster than the sequential tool
+it replaces under the same politeness cap** (11.5x with the cap lifted).
+
+## Benchmark
+
+![Files per second: the sequential baseline at 0.59, this project at 0.76 with one worker and 1.59 from four workers on, against a ceiling of 1.78 set by the politeness cap](docs/benchmark/throughput.svg)
+
+| Run | Wall time | Files/s | MB/s | Peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|
+| baseline: sequential, `requests` | 68.2 s | 0.59 | 0.56 | 35 MiB | 1.0x |
+| this project, 1 worker | 53.0 s | 0.76 | 0.73 | 68 MiB | 1.3x |
+| this project, 4 workers | 25.2 s | 1.59 | 1.52 | 69 MiB | **2.7x** |
+| this project, 8 workers | 25.2 s | 1.59 | 1.53 | 69 MiB | 2.7x |
+| this project, 16 workers | 25.2 s | 1.59 | 1.53 | 70 MiB | 2.7x |
+| this project, 16 workers, no cap (for scale only) | 5.9 s | 6.73 | 6.46 | 73 MiB | 11.5x |
+
+**Setup.** A local archive server holds 40 files (38 MB) in IIS listings, with 20 ms of
+latency per request and every response held to 1 MB/s, like a remote mirror whose
+per-connection bandwidth is the limit. Each run starts in its own process from an empty
+directory. Every mirrored file is checked by SHA-256 before the run counts. Median of
+3 rounds on a Windows laptop. Wall time includes each program's own imports (about 2.5 s for
+this project here).
+
+**The baseline** ([`bench/v1_sequential.py`](bench/v1_sequential.py)) reimplements the tool
+this project replaces, faithfully: one `requests` session, a depth-first crawl that sleeps
+0.2 s before each listing, then one download after another with a 0.5 s sleep before each.
+So it never asks for more than **2 files a second**. This project gets the same ceiling:
+`per_host_rate=2`, no burst, for listings and robots.txt too. Archive extraction is off on
+both sides (the baseline unpacked in a separate script).
+
+**Reading it.**
+* One worker is already 1.3x: the token bucket only waits when a request would start too
+  early, while the baseline adds its sleep on top of every transfer.
+* From 4 workers on, transfers overlap and the run sits at the cap: 45 requests at 2 per
+  second take 22 s, plus imports and the last transfer. 8 and 16 workers cannot beat it,
+  and they should not. Concurrency is how much we wait in parallel; the rate is what
+  the server sees (ADR 003).
+* Lifting the cap shows what the pipeline can do: 16 workers fill 16 connections and finish
+  in 5.9 s. Do not run that against someone else's server.
+* Peak memory is about twice the baseline's (httpx, pydantic, SQLite state, rich progress),
+  and it stays flat from 1 to 16 workers: the queues are bounded.
+
+`make bench` reruns it all and redraws the chart. Raw numbers are in
+[`docs/benchmark/results.json`](docs/benchmark/results.json).
+
+**Where parsing runs.** BeautifulSoup holds the GIL, and a 1,000-entry Apache listing takes
+0.8 s to parse, which used to stall every download for that long. Pages of 8 KiB or more now
+go to their own process pool: in a dry run of nine such directories the worst event-loop
+stall fell from 2.9 s to 0.23 s. Measured with `make parse-cost`, decided in
+[ADR 006](docs/adr/006-large-listings-parse-in-a-process-pool.md).
 
 ```mermaid
 flowchart LR
@@ -38,6 +86,7 @@ uv sync
 make demo              # dry run of the real CLI against a local archive server, no internet needed
 make demo-mirror       # the same, downloading, verifying and unpacking, with live progress bars
 make interrupt-resume  # Ctrl+C the CLI mid-run, check nothing is half-done, resume, compare every byte
+make bench             # the benchmark above: baseline vs this project, then the chart
 make kill-resume       # kill the CLI at random moments 20 times, resume, compare every byte
 ```
 
@@ -220,7 +269,7 @@ The patterns this repo is built around, and where to see them:
 | **Politeness as config** | GCRA token bucket per host, a global in-flight semaphore, a host-wide pause on 429/503 that honours `Retry-After`, robots.txt per RFC 9309 including `Crawl-delay`, one honest User-Agent with a contact URL |
 | **Structured concurrency** | `asyncio.TaskGroup`s own listers, writer, download and extract workers; a bug in any of them cancels the rest and surfaces |
 | **Backpressure** | bounded write, download and extract queues: slow extraction blocks downloads, which block the writer, which blocks the listers (tested with slow fakes) |
-| **CPU off the loop** | archives unpacked in a `ProcessPoolExecutor` (`spawn`, workers ignore Ctrl+C); hashing, fsync and rename in threads |
+| **CPU off the loop** | archives unpacked in a `ProcessPoolExecutor` (`spawn`, workers ignore Ctrl+C); listing pages of 8 KiB or more parsed in a second pool (ADR 006); hashing, fsync and rename in threads |
 | **Untrusted archives** | member names that are absolute, have a drive letter or contain `..` are skipped; links and devices skipped; bytes and members capped per archive and counted while writing (zip bomb tested) |
 | **Graceful shutdown** | first Ctrl+C/SIGTERM cancels through every `TaskGroup`: transfers roll back to `listed` and keep their `.part`, verified files finish, extractions roll back to `pending`, the run is recorded `interrupted`, exit 130. Status writes are shielded so a cancel never splits one. Second Ctrl+C: immediate |
 | **Crash safety** | an OS lock gives one process per state file; on start, `downloading` rows go back to `listed` and their parts resume, `extracting` rows go back to `pending`. Proven by 20/20 randomized hard kills |
@@ -233,6 +282,7 @@ Decisions and their trade-offs:
 * [ADR 003: Politeness lives in the HTTP adapter](docs/adr/003-politeness-in-the-http-adapter.md)
 * [ADR 004: Resumable downloads, and when a file counts as done](docs/adr/004-resumable-downloads.md)
 * [ADR 005: Graceful shutdown, and archives unpacked in worker processes](docs/adr/005-graceful-shutdown-and-extraction-workers.md)
+* [ADR 006: Large listing pages are parsed in a process pool](docs/adr/006-large-listings-parse-in-a-process-pool.md)
 
 More in [docs/architecture.md](docs/architecture.md).
 
@@ -268,18 +318,21 @@ against Apache's rounding), backoff, the token bucket on a fake clock, the HTTP 
 the range-resume protocol with respx, part files on disk, robots.txt, archive unpacking
 in every format with hostile input (path traversal, links, a zip bomb, too many members,
 corrupt files, leftovers of a killed attempt), the two-step shutdown, cancellation landing
-mid-write, and the lister, downloader and extractor with fakes. The integration tests run
-the real HTTP stack, SQLite, disk and process pool against the local archive server: every
-format, robots.txt, 503 retries, connections cut mid-body (with and without validators, and
+mid-write, where a listing page is parsed (loop or pool, by size), and the lister,
+downloader and extractor with fakes. The integration tests run
+the real HTTP stack, SQLite, disk and process pools against the local archive server: every
+format with parsing on the loop and in the pool, robots.txt, 503 retries, connections cut mid-body (with and without validators, and
 with a server that ignores `Range`), a corrupted body caught by its checksum, upstream
 changes, idempotent reruns, `resume`, unpacking real archives and a backlog of earlier
 ones, the state lock, schema migrations from versions 1 and 2, the rate limit in wall time,
-Ctrl+C then resume on the real CLI, and the 20 kill-and-resume trials. CI runs lint →
+Ctrl+C then resume on the real CLI, the benchmark baseline mirroring byte for byte, and the
+20 kill-and-resume trials. CI runs lint →
 types → unit → integration.
 
 ```
 src/archive_mirror/  domain/ · services/ · adapters/ · composition.py · settings.py · cli.py
-bench/               local archive server (real .tar.gz on request), demo runner, kill-and-resume harness
+bench/               local archive server (real .tar.gz on request), demo runner, kill-and-resume
+                     harness, sequential baseline, benchmark, chart, parse-cost measurement
 tests/               unit/ · integration/ · fixtures/
 deploy/              multi-stage Dockerfile, docker-compose demo
 docs/                architecture and ADRs

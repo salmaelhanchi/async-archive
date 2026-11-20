@@ -201,7 +201,7 @@ class Lister:
             self._seen.add(final_url)
 
         try:
-            listing = self._parse(page.text, final_url)
+            listing = await self._parse(page.text, final_url)
         except UnrecognizedListing as exc:
             return _Visit(done(ListingStatus.FAILED, str(exc), attempts=page.attempts))
 

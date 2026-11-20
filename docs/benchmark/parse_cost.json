@@ -1,0 +1,63 @@
+{
+  "pool_workers": 4,
+  "pool_start_s": 3.52,
+  "cpus": 12,
+  "pages": {
+    "apache-25": {
+      "page_kib": 5.4,
+      "loop_ms": 15.298,
+      "pool_round_trip_ms": 18.578,
+      "burst_200_loop_s": 3.744,
+      "burst_200_pool4_s": 1.062
+    },
+    "apache-1000": {
+      "page_kib": 204.4,
+      "loop_ms": 793.437,
+      "pool_round_trip_ms": 768.899,
+      "burst_200_loop_s": 151.228,
+      "burst_200_pool4_s": 41.372
+    },
+    "nginx-25": {
+      "page_kib": 2.7,
+      "loop_ms": 4.57,
+      "pool_round_trip_ms": 6.151,
+      "burst_200_loop_s": 0.967,
+      "burst_200_pool4_s": 0.316
+    },
+    "nginx-1000": {
+      "page_kib": 104.6,
+      "loop_ms": 151.65,
+      "pool_round_trip_ms": 161.054,
+      "burst_200_loop_s": 33.866,
+      "burst_200_pool4_s": 10.112
+    },
+    "iis-25": {
+      "page_kib": 2.5,
+      "loop_ms": 5.543,
+      "pool_round_trip_ms": 6.989,
+      "burst_200_loop_s": 1.047,
+      "burst_200_pool4_s": 0.369
+    },
+    "iis-1000": {
+      "page_kib": 93.9,
+      "loop_ms": 196.735,
+      "pool_round_trip_ms": 208.138,
+      "burst_200_loop_s": 39.552,
+      "burst_200_pool4_s": 12.596
+    }
+  },
+  "end_to_end_apache_9x1000": {
+    "on_loop": {
+      "files": 9000,
+      "seconds": 10.21,
+      "max_loop_stall_ms": 2943.6,
+      "p99_loop_stall_ms": 927.5
+    },
+    "in_pool": {
+      "files": 9000,
+      "seconds": 9.996,
+      "max_loop_stall_ms": 228.3,
+      "p99_loop_stall_ms": 88.3
+    }
+  }
+}
